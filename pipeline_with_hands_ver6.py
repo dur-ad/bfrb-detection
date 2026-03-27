@@ -500,11 +500,11 @@ def extract_landmarks_from_video(video_path, subject_id, activity_idx):
             body_rows.append(brow)
             face_rows.append(frow)
 
-            # ---- LEFT HAND (hand_world_landmarks: origin = hand wrist) ----
+            # ---- LEFT HAND (hand_landmarks: normalized image space) ----
             lrow = OrderedDict(frame=frame_idx)
-            if results.left_hand_world_landmarks:
+            if results.left_hand_landmarks:
                 for j, hname in enumerate(HAND_NAMES):
-                    lm = results.left_hand_world_landmarks.landmark[j]
+                    lm = results.left_hand_landmarks.landmark[j]
                     lrow[f"{hname}_x"] = lm.x
                     lrow[f"{hname}_y"] = lm.y
                     lrow[f"{hname}_z"] = lm.z
@@ -515,11 +515,11 @@ def extract_landmarks_from_video(video_path, subject_id, activity_idx):
                     lrow[f"{hname}_z"] = np.nan
             lhand_rows.append(lrow)
 
-            # ---- RIGHT HAND (hand_world_landmarks: origin = hand wrist) ----
+            # ---- RIGHT HAND (hand_landmarks: normalized image space) ----
             rrow = OrderedDict(frame=frame_idx)
-            if results.right_hand_world_landmarks:
+            if results.right_hand_landmarks:
                 for j, hname in enumerate(HAND_NAMES):
-                    lm = results.right_hand_world_landmarks.landmark[j]
+                    lm = results.right_hand_landmarks.landmark[j]
                     rrow[f"{hname}_x"] = lm.x
                     rrow[f"{hname}_y"] = lm.y
                     rrow[f"{hname}_z"] = lm.z
