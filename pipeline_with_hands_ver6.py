@@ -566,8 +566,18 @@ def detect_long_gaps(body_df, face_df):
 
 def knn_interpolate(df):
     cols = [c for c in df.columns if c != "frame"]
+
+    # Columns that are entirely NaN cannot be imputed — skip them,
+    # keep as NaN, impute only the columns that have at least one value.
+    all_nan_cols = [c for c in cols if df[c].isna().all()]
+    valid_cols   = [c for c in cols if c not in all_nan_cols]
+
+    if not valid_cols:
+        # Entire sheet is NaN (e.g. hand never detected) — nothing to impute
+        return df
+
     imputer = KNNImputer(n_neighbors=KNN_NEIGHBORS)
-    df[cols] = imputer.fit_transform(df[cols])
+    df[valid_cols] = imputer.fit_transform(df[valid_cols])
     return df
 
 def process_landmarks_file(coord_file):
