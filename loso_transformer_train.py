@@ -1,17 +1,6 @@
 """
 loso_transformer_train.py
 =========================
-Python / PyTorch equivalent of LOSO_LST_Improved_v2.m
-
-Key differences from the MATLAB version:
-  - BiLSTM replaced by any of 7 Transformer variants (see transformer_models.py)
-  - Variable-length sequences handled with padding + attention masks
-  - Stratified 5% validation split
-  - Per-fold confusion matrices saved as PNG
-  - Per-class metrics + overall summary written to Excel
-  - GPU → CPU adaptive fallback
-  - Run one model or sweep all variants
-
 Usage examples
 --------------
 # Single model (conformer, default hyper-params)
@@ -49,19 +38,24 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
+import time
 
 from transformer_models import build_model, MODEL_REGISTRY
 
 
 # ---------------------------------------------------------------------------
-# Constants (mirror MATLAB script)
+# Constants
 # ---------------------------------------------------------------------------
-FEATURE_ROWS   = list(range(1, 66)) + list(range(68, 83))   # 0-indexed (MATLAB 2:67,69:84 -> 1-indexed → subtract 1)
+# FEATURE_ROWS / EXPECTED_ROWS are no longer hardcoded.
+# The script uses ALL feature rows from whatever the data contains.
+# Row count is auto-detected from the first valid sample at runtime.
+FEATURE_ROWS   = None       # None = use all rows (auto-detected at runtime)
+EXPECTED_ROWS  = None       # None = accept any row count
+
 NUM_CLASSES    = 20
-DOWNSAMPLE     = 2          # MATLAB: seq = A(:, 1:2:end) – take every 2nd column
+DOWNSAMPLE     = 2          # take every 2nd time step (mirrors MATLAB's 1:2:end)
 AUG_SIGMA      = 0.01       # Gaussian noise std for training augmentation
 VAL_FRAC       = 0.05       # stratified validation fraction
-EXPECTED_ROWS  = 130        # skip files that don't have exactly 130 feature rows
 
 
 CLASS_NAMES = [
@@ -111,14 +105,17 @@ def collate_fn(batch):
 # ---------------------------------------------------------------------------
 def extract_sequence(sample: dict, mu=None, sigma=None, augment: bool = False) -> torch.Tensor | None:
     """
-    Extract feature-selected, downsampled sequence from a raw sample dict.
+    Extract a downsampled sequence from a raw sample dict using ALL feature rows.
     Returns a (T, C) float32 tensor or None if the sample is invalid.
+    Row count is auto-detected; any sample with >=1 feature row and no NaNs is accepted.
     """
     data = sample["data"]   # (total_features, time)
-    if data.shape[0] != EXPECTED_ROWS:
+
+    # Basic sanity: must have at least one feature row and one time step
+    if data.ndim != 2 or data.shape[0] == 0 or data.shape[1] == 0:
         return None
 
-    selected = data[FEATURE_ROWS, :]          # (C, T)
+    selected = data   # use ALL rows
     if np.isnan(selected).any():
         return None
 
@@ -559,9 +556,9 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     # ── Data & output ─────────────────────────────────────────────────────
-    p.add_argument("--data",         default="subjects_per_class.pkl",
+    p.add_argument("--data",         default="subjects_cleaned_12subjects.pkl",
                    help="Pickle file from load_cell_data.py")
-    p.add_argument("--model",        default="conformer",
+    p.add_argument("--model",        default="all",
                    choices=list(MODEL_REGISTRY) + ["all"],
                    help="Transformer variant to use, or 'all' to sweep")
     p.add_argument("--out_dir",      default="loso_results")
@@ -634,14 +631,29 @@ def main():
     print(f"Loaded {len(subjects)} subjects from {args.data}")
 
     model_kwargs = collect_model_kwargs(args)
-    models_to_run = list(MODEL_REGISTRY) if args.model == "all" else [args.model]
-
+    # models_to_run = list(MODEL_REGISTRY) if args.model == "all" else [args.model]
+    # EXCLUDE_MODELS = {"patch", "conv_stem", "hierarchical", "cross_attention", "linformer"}
+    EXCLUDE_MODELS = {}
+    if args.model == "all":
+        models_to_run = [m for m in MODEL_REGISTRY if m not in EXCLUDE_MODELS]
+    else:
+        models_to_run = [args.model]
     all_results = {}
+    model_times = {}
+
     for model_name in models_to_run:
         print(f"\n{'='*60}")
         print(f"  TRAINING MODEL: {model_name.upper()}")
         print(f"{'='*60}")
+        start_time = time.time()
         results = run_loso(subjects, model_name, model_kwargs, args)
+
+        elapsed = time.time() - start_time
+        hours = elapsed / 3600
+
+        print(f"\nTime  Model {model_name} finished in {hours:.2f} hours")
+
+        model_times[model_name] = hours
         all_results[model_name] = results
 
     # Cross-model comparison summary
@@ -667,6 +679,17 @@ def main():
         comp_path.parent.mkdir(parents=True, exist_ok=True)
         comp_df.to_csv(comp_path, index=False)
         print(f"\nComparison table saved -> {comp_path}")
+    
+    if len(model_times) > 0:
+        print(f"\n{'='*60}")
+        print("  MODEL TRAINING TIME SUMMARY")
+        print(f"{'='*60}")
+
+        for m, t in model_times.items():
+            print(f"  {m:20s}: {t:.2f} hours")
+
+        total_time = sum(model_times.values())
+        print(f"\n  Total time: {total_time:.2f} hours")
 
 
 if __name__ == "__main__":
