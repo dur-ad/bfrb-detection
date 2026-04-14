@@ -3,13 +3,6 @@ COMPLETE BFRB PIPELINE (Single Progress Bar Version)
 1. Extract MediaPipe landmarks from videos
 2. Process landmarks (gap detection, KNN imputation)
 3. Compute angles and distances for BFRB analysis (including head_tilt_angle)
-
-CHANGES:
-- model_complexity=2 (highest accuracy)
-- refine_face_landmarks=True
-- Hand world landmarks extracted (left + right): saved to "Left_Hand" and "Right_Hand" sheets
-- Hand vectors: 17->1 and 17->2 for both hands (in hand world space)
-- 4 new forearm-axis angles: R/L forearm vs hip axis, R/L forearm vs shoulder axis
 """
 
 # =============================================================================
@@ -49,9 +42,9 @@ from tqdm import tqdm
 # BFRB_ROOT    = Path("C:\\Users\\desk-7\\Documents\\test\\output_test")
 
 # main
-VIDEO_ROOT   = Path("C:\\Users\\desk-7\\Documents\\main_process\\input_videos_main")
-COORDS_ROOT  = Path("C:\\Users\\desk-7\\Documents\\main_process\\intermediate_coords_main")
-BFRB_ROOT    = Path("C:\\Users\\desk-7\\Documents\\main_process\\output_coords_main")
+VIDEO_ROOT   = Path("C:\\Users\\desk-7\\Documents\\main_process\\input_videos_main")  
+COORDS_ROOT  = Path("C:\\Users\\desk-7\\Documents\\main_process\\intermediate_coords")
+BFRB_ROOT    = Path("C:\\Users\\desk-7\\Documents\\main_process\\output_coords")
 DISCARD_ROOT = COORDS_ROOT / "discard"
 
 COORDS_ROOT.mkdir(exist_ok=True, parents=True)
@@ -434,6 +427,11 @@ def extract_landmarks_from_video(video_path, subject_id, activity_idx):
     class_name = CLASSES.get(activity_idx, f"Class_{activity_idx}")
     out_dir = COORDS_ROOT / class_name / subject_id
     out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{video_path.stem}_coords.xlsx"
+
+    # SKIP IF ALREADY DONE
+    if out_path.exists():
+        return out_path
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -550,10 +548,12 @@ def extract_landmarks_from_video(video_path, subject_id, activity_idx):
 # PART 2: LANDMARK PROCESSING + FEATURE COMPUTATION
 # =============================================================================
 
-def detect_long_gaps(body_df, face_df):
+def detect_long_gaps(body_df, face_df, lhand_df, rhand_df):
     body_missing = body_df.drop(columns=["frame"]).isna().all(axis=1)
     face_missing = face_df.drop(columns=["frame"]).isna().all(axis=1)
-    combined = body_missing & face_missing
+    lhand_missing = lhand_df.drop(columns=["frame"]).isna().all(axis=1)
+    rhand_missing = rhand_df.drop(columns=["frame"]).isna().all(axis=1)
+    combined = body_missing & face_missing & lhand_missing & rhand_missing
     count = 0
     for val in combined:
         if val:
@@ -566,16 +566,10 @@ def detect_long_gaps(body_df, face_df):
 
 def knn_interpolate(df):
     cols = [c for c in df.columns if c != "frame"]
-
-    # Columns that are entirely NaN cannot be imputed — skip them,
-    # keep as NaN, impute only the columns that have at least one value.
     all_nan_cols = [c for c in cols if df[c].isna().all()]
     valid_cols   = [c for c in cols if c not in all_nan_cols]
-
     if not valid_cols:
-        # Entire sheet is NaN (e.g. hand never detected) — nothing to impute
         return df
-
     imputer = KNNImputer(n_neighbors=KNN_NEIGHBORS)
     df[valid_cols] = imputer.fit_transform(df[valid_cols])
     return df
@@ -587,7 +581,7 @@ def process_landmarks_file(coord_file):
     rhand_df = pd.read_excel(coord_file, sheet_name="Right_Hand")
 
     # --- Discard files with long tracking gaps (pose only, same logic as before) ---
-    if detect_long_gaps(body_df, face_df):
+    if detect_long_gaps(body_df, face_df, lhand_df, rhand_df):
         rel = coord_file.relative_to(COORDS_ROOT)
         discard_path = DISCARD_ROOT / rel
         discard_path.parent.mkdir(parents=True, exist_ok=True)
