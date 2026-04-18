@@ -1,26 +1,6 @@
 """
-BFRB Real-Time Recognition UI  —  FIXED VERSION
+BFRB Real-Time Recognition UI 
 ================================================
-Key fixes vs original:
-1. Feature pipeline now exactly mirrors Script 1 (bfrb_processing.py):
-   - Same 275 features in the same column order
-   - Body landmarks in body-centred world-space coordinates
-   - Hand landmarks in image-normalised space (as in training)
-2. buffer_to_tensor:
-   - Builds (features=275, T) array, downsamples on time axis (::2),
-     transposes → (T', 275), normalises with checkpoint mu/sigma
-   - Uses pandas ffill/bfill for NaN handling (no KNN on rolling window)
-3. CameraThread uses model_complexity=2 and refine_face_landmarks
-   to match the extraction settings used in training.
-4. Feature column order is hardcoded to match BFRB_Features sheet output.
-
-Requirements:
-    pip install PyQt5 opencv-python mediapipe torch numpy pandas
-
-Usage:
-    python bfrb_realtime_ui.py
-
-Place model_state_dict.pt and model_class.py in the same folder.
 """
 
 import sys, os, time, collections, threading, importlib.util
@@ -31,6 +11,7 @@ import cv2
 import torch
 import torch.nn.functional as F
 import pandas as pd
+import requests
 
 # ── suppress noise ─────────────────────────────────────────────────────────
 os.environ["TF_CPP_MIN_LOG_LEVEL"]        = "3"
@@ -60,7 +41,7 @@ from PyQt5.QtGui   import QImage, QPixmap, QPainter, QColor, QFont, QBrush
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-BUFFER_FRAMES  = 90          # ~3 s at 30 fps
+BUFFER_FRAMES  = 50          # ~5 s at 10 fps
 INFER_INTERVAL = 0.5         # seconds between inference calls
 
 CLASS_NAMES = [
@@ -146,11 +127,6 @@ FEATURE_COLS = [
 #   Right_Hand  : hand landmark xyz (0-20)          → 21*3 = 63 cols
 #   BFRB_Features (above without "frame")           →        50 cols
 # Total: 66+33+63+63+50 = 275  ✓
-# BUT: training used only BFRB_Features (50 cols) based on README input_size.
-# README says input=(B,T,275). Let's check: 275 / 5 = 55 ... neither matches 50.
-# Actually Script 2 reads from the pkl which was built from a *separate* feature
-# extractor. We will build ALL raw coords + derived features and let the model
-# tell us the right count via mu/sigma shape.
 
 def _build_all_cols():
     cols = []
@@ -179,7 +155,7 @@ ALL_COLS = _build_all_cols()
 assert len(ALL_COLS) == 275, f"Expected 275 cols, got {len(ALL_COLS)}"
 
 # =============================================================================
-# GEOMETRY HELPERS  (mirror of Script 1)
+# GEOMETRY HELPERS  
 # =============================================================================
 
 def _angle_between(v1, v2):
@@ -503,7 +479,7 @@ class CameraThread(QThread):
 # =============================================================================
 
 class InferenceThread(QThread):
-    prediction_ready = pyqtSignal(list)   # list of (class_name, prob)
+    prediction_ready = pyqtSignal(list, float)  # list of (class_name, prob)
 
     def __init__(self, model, mu, sigma, input_size):
         super().__init__()
@@ -515,10 +491,12 @@ class InferenceThread(QThread):
         self._lock      = threading.Lock()
         self._running   = False
         self._trigger   = threading.Event()
+        self.last_capture_time = None
 
     def push_frame(self, row_dict):
         with self._lock:
             self._buffer.append(row_dict)
+            self.last_capture_time = time.time()
         self._trigger.set()
 
     def run(self):
@@ -538,14 +516,32 @@ class InferenceThread(QThread):
                 continue
 
             try:
-                with torch.no_grad():
-                    logits = self.model(tensor)
-                    probs  = F.softmax(logits, dim=-1)[0].numpy()
-                top5 = sorted(enumerate(probs), key=lambda x: -x[1])[:5]
-                result = [(CLASS_NAMES[i], float(p)) for i, p in top5]
-                self.prediction_ready.emit(result)
+                url = "https://bfrb-api.onrender.com/predict"
+                payload = {"features": tensor.squeeze(0).numpy().tolist()}  # (T', F) as list of lists
+                response = requests.post(url, json=payload, timeout=5)
+                latency_ms = (time.time() - self.last_capture_time) * 1000
+                print(f"Latency: {latency_ms:.1f} ms")
+                print(response.status_code)
+                print(response.text)
+                result_json = response.json()
+                if "predictions" not in result_json:
+                    print("API Error:", result_json)
+                    continue
+                result = [(item["class"], float(item["probability"])) for item in result_json["predictions"]]
+                self.prediction_ready.emit(result, latency_ms)
+
             except Exception as e:
-                print(f"[InferenceThread] error: {e}")
+                print(f"[Cloud Inference] error: {e}")
+               
+                # to add this if local
+                # with torch.no_grad():
+                #     logits = self.model(tensor)
+                #     probs  = F.softmax(logits, dim=-1)[0].numpy()
+                # top5 = sorted(enumerate(probs), key=lambda x: -x[1])[:5]
+                # result = [(CLASS_NAMES[i], float(p)) for i, p in top5]
+                # self.prediction_ready.emit(result)
+            #except Exception as e:
+                #print(f"[InferenceThread] error: {e}")
 
             time.sleep(INFER_INTERVAL)
 
@@ -622,6 +618,8 @@ class MainWindow(QMainWindow):
         self.cam_thread    = None
         self.infer_thread  = None
         self.fps_times     = collections.deque(maxlen=30)
+        self.missing_body_counter = 0
+        self.body_detected = False
 
         self._build_ui()
 
@@ -668,12 +666,15 @@ class MainWindow(QMainWindow):
 
         stat_row = QHBoxLayout()
         self.fps_lbl      = QLabel("FPS: —")
+        self.latency_lbl = QLabel("Latency: —")
+        self.latency_lbl.setStyleSheet("color:#555; font-size:11px;")
         self.buf_lbl      = QLabel("Buffer: 0/90")
         self.track_lbl    = QLabel("● No tracking")
         for l in [self.fps_lbl, self.buf_lbl, self.track_lbl]:
             l.setStyleSheet("color:#555; font-size:11px;")
         stat_row.addWidget(self.fps_lbl)
         stat_row.addWidget(self.buf_lbl)
+        stat_row.addWidget(self.latency_lbl)
         stat_row.addStretch()
         stat_row.addWidget(self.track_lbl)
         lv.addLayout(stat_row)
@@ -833,46 +834,122 @@ class MainWindow(QMainWindow):
 
         has_lhand = results.left_hand_landmarks  is not None
         has_rhand = results.right_hand_landmarks is not None
+        full_body_visible = (
+            has_body and
+            has_lhand and
+            has_rhand
+        )
+        if full_body_visible:
+            # reset missing counter
+            self.missing_body_counter = 0
+            self.body_detected = True
 
-        if has_body and has_lhand and has_rhand:
-            self.track_lbl.setText("● Body + Both Hands")
-            self.track_lbl.setStyleSheet("color:#44cc77; font-size:11px;")
+            self.track_lbl.setText(
+                "● Full body detected — inference running"
+            )
+            self.track_lbl.setStyleSheet(
+                "color:#44cc77; font-size:11px;"
+            )
+
             if self.infer_thread:
                 self.infer_thread.push_frame(row)
+
                 buf_len = len(self.infer_thread._buffer)
                 cap_val = self.buf_slider.value()
-                self.buf_lbl.setText(f"Buffer: {buf_len}/{cap_val}")
-        elif has_body:
-            self.track_lbl.setText("● Body only — show both hands")
-            self.track_lbl.setStyleSheet("color:#ccaa30; font-size:11px;")
-            # Still push — hand features will be NaN, ffill will handle gaps
-            if self.infer_thread:
-                self.infer_thread.push_frame(row)
-                buf_len = len(self.infer_thread._buffer)
-                self.buf_lbl.setText(f"Buffer: {buf_len}/{self.buf_slider.value()}")
-        else:
-            self.track_lbl.setText("● No body detected")
-            self.track_lbl.setStyleSheet("color:#cc3344; font-size:11px;")
-            if self.infer_thread:
-                self.infer_thread._buffer.clear()
-            self.buf_lbl.setText("Buffer: cleared")
 
-        # Display frame
+                self.buf_lbl.setText(
+                    f"Buffer: {buf_len}/{cap_val}"
+                )
+
+        else:
+            # tracking lost
+            self.missing_body_counter += 1
+
+            if self.missing_body_counter >= 10:
+                self.body_detected = False
+
+                self.track_lbl.setText(
+                    "● Please show full body"
+                )
+                self.track_lbl.setStyleSheet(
+                    "color:#ff5555; font-size:11px;"
+                )
+
+                if self.infer_thread:
+                    self.infer_thread._buffer.clear()
+
+                self.buf_lbl.setText(
+                    "Buffer: cleared"
+                )
+
+            else:
+                self.track_lbl.setText(
+                    f"● Lost tracking ({self.missing_body_counter}/10)"
+                )
+                self.track_lbl.setStyleSheet(
+                    "color:#ccaa30; font-size:11px;"
+                )
+
+        # ── Display frame on UI ────────────────────────────────
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch*w, QImage.Format_RGB888)
-        pix  = QPixmap.fromImage(qimg).scaled(
-            self.video_label.width(), self.video_label.height(),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        qimg = QImage(
+            rgb.data,
+            w,
+            h,
+            ch * w,
+            QImage.Format_RGB888
+        )
+
+        pix = QPixmap.fromImage(qimg).scaled(
+            self.video_label.width(),
+            self.video_label.height(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+
         self.video_label.setPixmap(pix)
+        # if has_body and has_lhand and has_rhand:
+        #     self.track_lbl.setText("● Body + Both Hands")
+        #     self.track_lbl.setStyleSheet("color:#44cc77; font-size:11px;")
+        #     if self.infer_thread:
+        #         self.infer_thread.push_frame(row)
+        #         buf_len = len(self.infer_thread._buffer)
+        #         cap_val = self.buf_slider.value()
+        #         self.buf_lbl.setText(f"Buffer: {buf_len}/{cap_val}")
+        # elif has_body:
+        #     self.track_lbl.setText("● Body only — show both hands")
+        #     self.track_lbl.setStyleSheet("color:#ccaa30; font-size:11px;")
+        #     # Still push — hand features will be NaN, ffill will handle gaps
+        #     if self.infer_thread:
+        #         self.infer_thread.push_frame(row)
+        #         buf_len = len(self.infer_thread._buffer)
+        #         self.buf_lbl.setText(f"Buffer: {buf_len}/{self.buf_slider.value()}")
+        # else:
+        #     self.track_lbl.setText("● No body detected")
+        #     self.track_lbl.setStyleSheet("color:#cc3344; font-size:11px;")
+        #     if self.infer_thread:
+        #         self.infer_thread._buffer.clear()
+        #     self.buf_lbl.setText("Buffer: cleared")
+
+        # # Display frame
+        # rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # h, w, ch = rgb.shape
+        # qimg = QImage(rgb.data, w, h, ch*w, QImage.Format_RGB888)
+        # pix  = QPixmap.fromImage(qimg).scaled(
+        #     self.video_label.width(), self.video_label.height(),
+        #     Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        # self.video_label.setPixmap(pix)
 
     # ── Prediction handler ─────────────────────────────────────────────────
-    def _on_prediction(self, top5):
+    def _on_prediction(self, top5, latency):
         if not top5:
             return
         top_name, _ = top5[0]
         self.top_label.setText(top_name)
         self._set_badge(top_name)
+        self.latency_lbl.setText(f"Latency: {latency:.1f} ms")
         for i, bar in enumerate(self.conf_bars):
             if i < len(top5):
                 name, prob = top5[i]
