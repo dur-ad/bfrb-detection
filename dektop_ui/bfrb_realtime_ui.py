@@ -61,8 +61,9 @@ import database as db
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-BUFFER_FRAMES  = 50
-INFER_INTERVAL = 0.5
+WINDOW_SECONDS = 5
+TARGET_FPS = 10   # or your effective FPS after MediaPipe
+BUFFER_FRAMES = WINDOW_SECONDS * TARGET_FPS
 
 CLASS_NAMES = [
     "Cuticle Picking", "Eyeglasses",       "Face Touching",  "Hair Pulling",
@@ -439,8 +440,8 @@ class CameraThread(QThread):
     def run(self):
         self._running = True
         cap = cv2.VideoCapture(self.cam_idx, cv2.CAP_DSHOW)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         if not cap.isOpened():
             self.error.emit(f"Cannot open camera {self.cam_idx}"); return
         with mp_holistic.Holistic(
@@ -495,13 +496,15 @@ class InferenceThread(QThread):
     def push_frame(self, row_dict):
         with self._lock:
             self._buffer.append(row_dict)
-            self.last_capture_time = time.time()
-        self._trigger.set()
+
+            # Trigger ONLY when full window collected
+            if len(self._buffer) >= BUFFER_FRAMES:
+                self._trigger.set()
 
     def run(self):
         self._running = True
         while self._running:
-            self._trigger.wait(timeout=INFER_INTERVAL)
+            self._trigger.wait()
             self._trigger.clear()
             with self._lock:
                 buf = list(self._buffer)
@@ -522,9 +525,11 @@ class InferenceThread(QThread):
                 result = [(item["class"], float(item["probability"]))
                           for item in rj["predictions"]]
                 self.prediction_ready.emit(result, latency_ms)
+                with self._lock:
+                    self._buffer.clear()
             except Exception as e:
                 print(f"[InferenceThread] {e}")
-            time.sleep(INFER_INTERVAL)
+            
 
     def stop(self):
         self._running = False; self._trigger.set(); self.wait()
