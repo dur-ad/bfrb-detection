@@ -53,7 +53,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore  import Qt, QThread, pyqtSignal, QRect, QTimer, QSize
 from PyQt5.QtGui   import (
     QImage, QPixmap, QPainter, QColor, QFont, QBrush, QPen, QLinearGradient,
-    QPalette,
+    QPalette, QIcon,
 )
 
 import database as db
@@ -82,142 +82,193 @@ BFRB_CLASSES = {
 # THEME
 # =============================================================================
 THEME = {
-    "bg":        "#0a0a12",
-    "panel":     "#0f0f1e",
-    "border":    "#1c1c34",
-    "accent":    "#6c63ff",
-    "accent2":   "#ff6584",
-    "text":      "#e0e0f0",
-    "subtext":   "#666688",
-    "success":   "#44cc77",
-    "warning":   "#ccaa30",
-    "danger":    "#ff5577",
-    "bfrb_bar":  "#ff4664",
-    "norm_bar":  "#46c37b",
+    "bg":        "#0b0b18",
+    "panel":     "#11112a",
+    "border":    "#23234a",
+    "accent":    "#7b6fff",
+    "accent2":   "#ff6b8a",
+    "text":      "#eaeaf8",
+    "subtext":   "#7878a8",
+    "success":   "#3ddc84",
+    "warning":   "#f0b429",
+    "danger":    "#ff4d6d",
+    "bfrb_bar":  "#ff4d6d",
+    "norm_bar":  "#3ddc84",
+    "card":      "#16163a",
 }
 
 APP_STYLE = f"""
 QMainWindow, QDialog, QWidget {{
     background: {THEME['bg']};
     color: {THEME['text']};
-    font-family: 'Segoe UI', Consolas, monospace;
-    font-size: 13px;
+    font-family: 'Segoe UI', 'Arial', sans-serif;
+    font-size: 14px;
 }}
 QLabel {{ color: {THEME['text']}; }}
 QLineEdit {{
-    background: #13132a;
+    background: {THEME['card']};
     color: {THEME['text']};
     border: 1px solid {THEME['border']};
-    border-radius: 6px;
-    padding: 8px 12px;
-    font-size: 13px;
+    border-radius: 7px;
+    padding: 9px 14px;
+    font-size: 14px;
 }}
 QLineEdit:focus {{ border-color: {THEME['accent']}; }}
 QPushButton {{
-    background: #1a1a2e;
+    background: #1e1e40;
     color: {THEME['text']};
     border: 1px solid {THEME['border']};
-    border-radius: 6px;
-    padding: 8px 18px;
-    font-size: 13px;
+    border-radius: 7px;
+    padding: 9px 20px;
+    font-size: 14px;
 }}
-QPushButton:hover   {{ background: #22224a; border-color: {THEME['accent']}; }}
-QPushButton:pressed {{ background: #14143a; }}
-QPushButton:disabled {{ color: #333355; border-color: #181828; }}
+QPushButton:hover   {{ background: #28285a; border-color: {THEME['accent']}; }}
+QPushButton:pressed {{ background: #161638; }}
+QPushButton:disabled {{ color: #33335a; border-color: #1a1a38; }}
 QPushButton#primary {{
     background: {THEME['accent']};
     color: #fff;
     border: none;
-    font-weight: 600;
+    font-weight: 700;
+    font-size: 14px;
 }}
-QPushButton#primary:hover   {{ background: #7c74ff; }}
-QPushButton#primary:pressed {{ background: #5c54df; }}
+QPushButton#primary:hover   {{ background: #9088ff; }}
+QPushButton#primary:pressed {{ background: #5e58d0; }}
 QPushButton#danger {{
     background: #3a0f1e;
     color: {THEME['danger']};
-    border: 1px solid #551525;
+    border: 1px solid #661530;
+    font-size: 14px;
 }}
-QPushButton#danger:hover {{ background: #4a1428; border-color: {THEME['danger']}; }}
+QPushButton#danger:hover {{ background: #4e1428; border-color: {THEME['danger']}; }}
 QFrame#panel {{
     background: {THEME['panel']};
     border: 1px solid {THEME['border']};
-    border-radius: 10px;
+    border-radius: 12px;
 }}
 QTabWidget::pane {{
     background: {THEME['panel']};
     border: 1px solid {THEME['border']};
-    border-radius: 8px;
+    border-radius: 10px;
 }}
 QTabBar::tab {{
-    background: #0d0d1a;
+    background: #0e0e22;
     color: {THEME['subtext']};
     border: 1px solid {THEME['border']};
     border-bottom: none;
-    padding: 9px 22px;
-    margin-right: 2px;
-    border-radius: 6px 6px 0 0;
-    font-size: 13px;
+    padding: 10px 26px;
+    margin-right: 3px;
+    border-radius: 7px 7px 0 0;
+    font-size: 14px;
 }}
 QTabBar::tab:selected {{
     background: {THEME['panel']};
     color: {THEME['text']};
     border-color: {THEME['accent']};
+    font-weight: 600;
 }}
 QTabBar::tab:hover {{ color: {THEME['text']}; }}
 QTableWidget {{
-    background: #0d0d1a;
+    background: #0e0e22;
     color: {THEME['text']};
     border: 1px solid {THEME['border']};
-    border-radius: 6px;
+    border-radius: 7px;
     gridline-color: {THEME['border']};
-    font-size: 12px;
+    font-size: 13px;
 }}
-QTableWidget::item:selected {{ background: #22224a; }}
+QTableWidget::item:selected {{ background: #28285a; }}
 QHeaderView::section {{
-    background: #13132a;
+    background: {THEME['card']};
     color: {THEME['subtext']};
     border: none;
     border-bottom: 1px solid {THEME['border']};
-    padding: 8px;
-    font-size: 12px;
-    font-weight: 600;
+    padding: 10px;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 1px;
 }}
 QSlider::groove:horizontal {{
-    height: 4px; background: #252540; border-radius: 2px;
+    height: 5px; background: #2a2a50; border-radius: 3px;
 }}
 QSlider::handle:horizontal {{
-    width: 14px; height: 14px; margin: -5px 0;
-    background: {THEME['accent']}; border-radius: 7px;
+    width: 16px; height: 16px; margin: -6px 0;
+    background: {THEME['accent']}; border-radius: 8px;
 }}
-QSlider::sub-page:horizontal {{ background: {THEME['accent']}; border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: {THEME['accent']}; border-radius: 3px; }}
 QComboBox {{
-    background: #13132a;
+    background: {THEME['card']};
     color: {THEME['text']};
     border: 1px solid {THEME['border']};
-    border-radius: 6px;
-    padding: 7px 12px;
+    border-radius: 7px;
+    padding: 8px 14px;
+    font-size: 14px;
 }}
 QComboBox:focus {{ border-color: {THEME['accent']}; }}
 QComboBox QAbstractItemView {{
-    background: #13132a;
+    background: {THEME['card']};
     color: {THEME['text']};
     border: 1px solid {THEME['border']};
-    selection-background-color: #22224a;
+    selection-background-color: #28285a;
 }}
 QScrollBar:vertical {{
-    background: #0d0d1a; width: 8px; border-radius: 4px;
+    background: #0e0e22; width: 8px; border-radius: 4px;
 }}
 QScrollBar::handle:vertical {{
-    background: #252545; border-radius: 4px; min-height: 20px;
+    background: #2a2a55; border-radius: 4px; min-height: 24px;
 }}
-QCheckBox {{ color: {THEME['text']}; spacing: 8px; }}
+QCheckBox {{ color: {THEME['text']}; spacing: 10px; font-size: 14px; }}
 QCheckBox::indicator {{
-    width: 16px; height: 16px; border-radius: 3px;
-    border: 1px solid {THEME['border']}; background: #13132a;
+    width: 18px; height: 18px; border-radius: 4px;
+    border: 1px solid {THEME['border']}; background: {THEME['card']};
 }}
 QCheckBox::indicator:checked {{ background: {THEME['accent']}; border-color: {THEME['accent']}; }}
 QMessageBox {{ background: {THEME['panel']}; color: {THEME['text']}; }}
 """
+
+# =============================================================================
+# APP ICON  (generated in-code, no external file needed)
+# =============================================================================
+def make_app_icon() -> QPixmap:
+    """Draw a simple BFRB pulse-wave icon programmatically."""
+    size = 64
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+
+    # Background circle
+    p.setBrush(QColor(THEME['panel']))
+    p.setPen(QPen(QColor(THEME['accent']), 2))
+    p.drawEllipse(2, 2, size - 4, size - 4)
+
+    # Pulse / waveform line
+    pen = QPen(QColor(THEME['accent']), 3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    p.setPen(pen)
+    from PyQt5.QtGui import QPainterPath
+    path = QPainterPath()
+    cx, cy = size // 2, size // 2
+    # flat → spike up → spike down → flat
+    pts = [
+        (8,  cy),
+        (18, cy),
+        (24, cy - 16),
+        (30, cy + 14),
+        (36, cy - 8),
+        (40, cy),
+        (56, cy),
+    ]
+    path.moveTo(*pts[0])
+    for x, y in pts[1:]:
+        path.lineTo(x, y)
+    p.drawPath(path)
+
+    # Accent dot
+    p.setBrush(QColor(THEME['danger']))
+    p.setPen(Qt.NoPen)
+    p.drawEllipse(28, cy - 18, 6, 6)
+
+    p.end()
+    return pix
 
 def styled_panel():
     f = QFrame(); f.setObjectName("panel"); return f
@@ -225,10 +276,10 @@ def styled_panel():
 def section_label(text, color=None):
     l = QLabel(text)
     c = color or THEME['subtext']
-    l.setStyleSheet(f"color:{c}; font-size:11px; font-weight:600; letter-spacing:1px;")
+    l.setStyleSheet(f"color:{c}; font-size:12px; font-weight:700; letter-spacing:1px;")
     return l
 
-def heading(text, size=16, color=None):
+def heading(text, size=17, color=None):
     l = QLabel(text)
     c = color or THEME['text']
     l.setStyleSheet(f"color:{c}; font-size:{size}px; font-weight:700;")
@@ -550,18 +601,18 @@ class ConfidenceBar(QWidget):
     def paintEvent(self, event):
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
         W, H = self.width(), self.height()
-        label_w = 180; bar_x = label_w + 8
-        bar_w = W - bar_x - 58; bar_h = 10; bar_y = (H - bar_h) // 2
-        p.setPen(QColor(THEME['text'])); p.setFont(QFont("Segoe UI", 10))
+        label_w = 190; bar_x = label_w + 10
+        bar_w = W - bar_x - 64; bar_h = 10; bar_y = (H - bar_h) // 2
+        p.setPen(QColor(THEME['text'])); p.setFont(QFont("Segoe UI", 11))
         p.drawText(QRect(0, 0, label_w, H), Qt.AlignVCenter | Qt.AlignLeft, self.label_text)
-        p.setBrush(QColor("#1a1a2e")); p.setPen(Qt.NoPen)
-        p.drawRoundedRect(bar_x, bar_y, bar_w, bar_h, 3, 3)
+        p.setBrush(QColor("#1e1e40")); p.setPen(Qt.NoPen)
+        p.drawRoundedRect(bar_x, bar_y, bar_w, bar_h, 4, 4)
         fill_w = max(0, int(bar_w * self.value))
         if fill_w > 0:
             color = QColor(THEME['bfrb_bar']) if self.is_bfrb else QColor(THEME['norm_bar'])
-            p.setBrush(color); p.drawRoundedRect(bar_x, bar_y, fill_w, bar_h, 3, 3)
-        p.setPen(QColor(THEME['subtext'])); p.setFont(QFont("Segoe UI", 10))
-        p.drawText(QRect(bar_x + bar_w + 6, 0, 52, H),
+            p.setBrush(color); p.drawRoundedRect(bar_x, bar_y, fill_w, bar_h, 4, 4)
+        p.setPen(QColor(THEME['subtext'])); p.setFont(QFont("Segoe UI", 11))
+        p.drawText(QRect(bar_x + bar_w + 8, 0, 56, H),
                    Qt.AlignVCenter | Qt.AlignLeft, f"{self.value*100:.1f}%")
 
 # =============================================================================
@@ -639,48 +690,74 @@ class DashboardWidget(QWidget):
         self._tick_timer.timeout.connect(self._update_time_ago)
         self._tick_timer.start(10000)
 
+        # User-side polling: refresh live stats from DB every 4 seconds
+        if not self.is_admin:
+            self._poll_timer = QTimer()
+            self._poll_timer.timeout.connect(self._poll_user_stats)
+            self._poll_timer.start(4000)
+
     # ── Build UI ──────────────────────────────────────────────────────────
     def _build(self):
-        root = QHBoxLayout(self); root.setContentsMargins(0,0,0,0); root.setSpacing(12)
+        root = QHBoxLayout(self); root.setContentsMargins(0,0,0,0); root.setSpacing(14)
 
-        # Left: video
-        left = styled_panel(); lv = QVBoxLayout(left); lv.setContentsMargins(10,10,10,10)
+        # ── Left: video ────────────────────────────────────────────────────
+        left = styled_panel(); lv = QVBoxLayout(left)
+        lv.setContentsMargins(10,10,10,10); lv.setSpacing(8)
 
         self.video_label = QLabel()
         self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setMinimumSize(560, 420)
-        self.video_label.setStyleSheet("background:#000; border-radius:6px;")
+        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.video_label.setMinimumSize(480, 360)
+        self.video_label.setStyleSheet(
+            "background:#060612; border-radius:8px; color:#444466; font-size:15px;")
         self.video_label.setText("No active session")
-        self.video_label.setAlignment(Qt.AlignCenter)
-        lv.addWidget(self.video_label)
+        lv.addWidget(self.video_label, stretch=1)
 
         stat_row = QHBoxLayout()
         self.fps_lbl     = QLabel("FPS: —")
         self.latency_lbl = QLabel("Latency: —")
         self.track_lbl   = QLabel("● Idle")
-        for l in [self.fps_lbl, self.latency_lbl, self.track_lbl]:
-            l.setStyleSheet(f"color:{THEME['subtext']}; font-size:11px;")
+        for lbl in [self.fps_lbl, self.latency_lbl, self.track_lbl]:
+            lbl.setStyleSheet(f"color:{THEME['subtext']}; font-size:13px;")
         stat_row.addWidget(self.fps_lbl)
         stat_row.addWidget(self.latency_lbl)
         stat_row.addStretch()
         stat_row.addWidget(self.track_lbl)
         lv.addLayout(stat_row)
-        root.addWidget(left, stretch=3)
+        root.addWidget(left, stretch=5)
 
-        # Right: controls + predictions
-        right = QVBoxLayout(); right.setSpacing(10)
+        # ── Right: controls + predictions (inside a scroll area) ───────────
+        right_container = QWidget()
+        right_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        right_outer = QVBoxLayout(right_container)
+        right_outer.setContentsMargins(0, 0, 0, 0); right_outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setStyleSheet(
+            "QScrollArea { border: none; background: transparent; }"
+            f"QScrollBar:vertical {{ background: #0e0e22; width: 6px; border-radius: 3px; }}"
+            f"QScrollBar::handle:vertical {{ background: #2a2a55; border-radius: 3px; min-height: 20px; }}"
+        )
+
+        scroll_contents = QWidget()
+        scroll_contents.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        right = QVBoxLayout(scroll_contents)
+        right.setSpacing(12); right.setContentsMargins(0, 0, 6, 0)
 
         # ── Session control panel (admin only) ────────────────────────────
         if self.is_admin:
             ctrl = styled_panel(); cv = QVBoxLayout(ctrl)
-            cv.setContentsMargins(14,12,14,12); cv.setSpacing(8)
-            cv.addWidget(heading("Session Control", 14, THEME['accent']))
+            cv.setContentsMargins(16,14,16,14); cv.setSpacing(10)
+            cv.addWidget(heading("Session Control", 15, THEME['accent']))
             cv.addWidget(section_label("SELECT USER"))
             self.user_combo = QComboBox()
             self._refresh_user_combo()
             cv.addWidget(self.user_combo)
             cv.addWidget(hsep())
-            btn_row = QHBoxLayout(); btn_row.setSpacing(6)
+            btn_row = QHBoxLayout(); btn_row.setSpacing(8)
             self.start_btn = QPushButton("▶  Start")
             self.start_btn.setObjectName("primary")
             self.start_btn.clicked.connect(self._start_session)
@@ -696,61 +773,74 @@ class DashboardWidget(QWidget):
             btn_row.addWidget(self.stop_btn)
             cv.addLayout(btn_row)
             self.session_status = QLabel("No session active")
-            self.session_status.setStyleSheet(f"color:{THEME['subtext']}; font-size:11px;")
+            self.session_status.setStyleSheet(f"color:{THEME['subtext']}; font-size:13px;")
             cv.addWidget(self.session_status)
             right.addWidget(ctrl)
 
-        # ── Stats panel ────────────────────────────────────────────────────
+        # ── Live Stats panel ───────────────────────────────────────────────
         stats = styled_panel(); sv = QVBoxLayout(stats)
-        sv.setContentsMargins(14,12,14,12); sv.setSpacing(8)
-        sv.addWidget(heading("Live Stats", 14, THEME['accent']))
+        sv.setContentsMargins(16,14,16,14); sv.setSpacing(10)
+        sv.addWidget(heading("Live Stats", 15, THEME['accent']))
 
         # BFRB counter + last detection
-        grid = QGridLayout(); grid.setSpacing(8)
+        grid = QGridLayout(); grid.setSpacing(10)
         grid.addWidget(section_label("BFRB EVENTS"), 0, 0)
         grid.addWidget(section_label("LAST DETECTION"), 0, 1)
+
         self.bfrb_lbl = QLabel("0")
         self.bfrb_lbl.setStyleSheet(
-            f"font-size:32px; font-weight:700; color:{THEME['danger']};")
+            f"font-size:42px; font-weight:800; color:{THEME['danger']};")
+
         self.last_det_lbl = QLabel("—")
         self.last_det_lbl.setStyleSheet(
-            f"font-size:13px; color:{THEME['text']}; font-weight:600;")
+            f"font-size:14px; color:{THEME['text']}; font-weight:700;")
+        self.last_det_lbl.setWordWrap(True)
+
         self.time_ago_lbl = QLabel("")
-        self.time_ago_lbl.setStyleSheet(f"color:{THEME['subtext']}; font-size:11px;")
+        self.time_ago_lbl.setStyleSheet(f"color:{THEME['subtext']}; font-size:13px;")
+
         grid.addWidget(self.bfrb_lbl, 1, 0)
         det_col = QVBoxLayout()
         det_col.addWidget(self.last_det_lbl)
         det_col.addWidget(self.time_ago_lbl)
-        det_col.setSpacing(2)
+        det_col.setSpacing(3)
         det_w = QWidget(); det_w.setLayout(det_col)
         grid.addWidget(det_w, 1, 1)
         sv.addLayout(grid)
         sv.addWidget(hsep())
 
-        # Badge
+        # Status badge
         self.badge = QLabel("Waiting for inference…")
-        self.badge.setFixedHeight(28)
+        self.badge.setFixedHeight(32)
         self.badge.setAlignment(Qt.AlignCenter)
         self.badge.setStyleSheet(
-            f"background:#181828; color:{THEME['subtext']}; border:1px solid {THEME['border']};"
-            "border-radius:5px; font-size:12px; padding:2px 10px;")
+            f"background:#1a1a38; color:{THEME['subtext']}; border:1px solid {THEME['border']};"
+            "border-radius:6px; font-size:13px; font-weight:600; padding:2px 12px;")
         sv.addWidget(self.badge)
 
         # Top prediction
         self.top_label = QLabel("—")
         self.top_label.setStyleSheet(
-            f"font-size:20px; font-weight:700; color:#fff;"
-            f"background:#13132a; border-radius:8px; padding:10px 14px;")
+            f"font-size:22px; font-weight:800; color:#fff;"
+            f"background:{THEME['card']}; border-radius:10px; padding:12px 16px;")
         self.top_label.setWordWrap(True)
+        self.top_label.setMinimumHeight(52)
         sv.addWidget(self.top_label)
+
         sv.addWidget(hsep())
         sv.addWidget(section_label("TOP 5 PREDICTIONS"))
         self.conf_bars = []
         for _ in range(5):
-            bar = ConfidenceBar(); sv.addWidget(bar); self.conf_bars.append(bar)
+            bar = ConfidenceBar()
+            sv.addWidget(bar)
+            self.conf_bars.append(bar)
+
         right.addWidget(stats)
         right.addStretch()
-        root.addLayout(right, stretch=2)
+
+        scroll.setWidget(scroll_contents)
+        right_outer.addWidget(scroll)
+        root.addWidget(right_container, stretch=3)
 
     def _refresh_user_combo(self):
         if not self.is_admin: return
@@ -820,10 +910,13 @@ class DashboardWidget(QWidget):
             db.end_session(self.session_id, self.event_count)
             self.session_ended.emit(self.session_id, self.event_count)
         self.session_id = None; self.session_user_id = None
+        # Properly clear the video — setPixmap(QPixmap()) alone is unreliable
+        self.video_label.clear()
+        self.video_label.setStyleSheet(
+            "background:#060612; border-radius:8px; color:#444466; font-size:15px;")
         self.video_label.setText("No active session")
-        self.video_label.setPixmap(QPixmap())
         self.track_lbl.setText("● Idle")
-        self.track_lbl.setStyleSheet(f"color:{THEME['subtext']}; font-size:11px;")
+        self.track_lbl.setStyleSheet(f"color:{THEME['subtext']}; font-size:13px;")
         self.fps_lbl.setText("FPS: —"); self.latency_lbl.setText("Latency: —")
         if self.is_admin:
             self.start_btn.setEnabled(True)
@@ -832,7 +925,7 @@ class DashboardWidget(QWidget):
             self.stop_btn.setEnabled(False)
             self.user_combo.setEnabled(True)
             self.session_status.setText("Session ended")
-            self.session_status.setStyleSheet(f"color:{THEME['subtext']}; font-size:11px;")
+            self.session_status.setStyleSheet(f"color:{THEME['subtext']}; font-size:13px;")
         self._paused = False
 
     # ── For user-side: receive session signal from admin ──────────────────
@@ -879,6 +972,7 @@ class DashboardWidget(QWidget):
             self.video_label.width(), self.video_label.height(),
             Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.video_label.setPixmap(pix)
+        self.video_label.setAlignment(Qt.AlignCenter)
 
     # ── Prediction handler ─────────────────────────────────────────────────
     def _on_prediction(self, top5, latency):
@@ -928,6 +1022,45 @@ class DashboardWidget(QWidget):
         elif mins == 1: self.time_ago_lbl.setText("1 min ago")
         else:           self.time_ago_lbl.setText(f"{mins} mins ago")
 
+    def _poll_user_stats(self):
+        """For user-side view: poll DB for the latest active/recent session and refresh stats."""
+        if self.is_admin:
+            return
+        uid = self.current_user["user_id"]
+        sessions = db.get_sessions_for_user(uid)
+        if not sessions:
+            return
+        latest = sessions[0]  # ordered DESC by start_time
+        sid = latest["session_id"]
+
+        # Only update if this is an active (no end_time) or very recent session
+        end_time = latest.get("end_time")
+        event_count = latest.get("event_count", 0) or 0
+        self.bfrb_lbl.setText(str(event_count))
+
+        # Pull latest detection event for this session
+        events = db.get_events_for_session(sid)
+        if events:
+            latest_event = events[-1]  # ordered ASC by timestamp
+            self.last_det_lbl.setText(latest_event["behavior_type"])
+            try:
+                ts = datetime.fromisoformat(latest_event["timestamp"])
+                self.last_detection = ts
+                delta = datetime.now() - ts
+                mins = int(delta.total_seconds() // 60)
+                if mins == 0:   self.time_ago_lbl.setText("just now")
+                elif mins == 1: self.time_ago_lbl.setText("1 min ago")
+                else:           self.time_ago_lbl.setText(f"{mins} mins ago")
+            except Exception:
+                pass
+
+        if end_time:
+            # Session ended — show idle badge
+            self.badge.setText("Session ended")
+            self.badge.setStyleSheet(
+                f"background:#1a1a38; color:{THEME['subtext']}; border:1px solid {THEME['border']};"
+                "border-radius:6px; font-size:13px; font-weight:600; padding:2px 12px;")
+
     def refresh_prefs(self, prefs: dict):
         self.prefs = prefs
         if self.cam_thread:
@@ -935,6 +1068,8 @@ class DashboardWidget(QWidget):
 
     def cleanup(self):
         self._tick_timer.stop()
+        if not self.is_admin and hasattr(self, '_poll_timer'):
+            self._poll_timer.stop()
         if self.cam_thread:   self.cam_thread.stop()
         if self.infer_thread: self.infer_thread.stop()
         if self.session_id:   db.end_session(self.session_id, self.event_count)
@@ -1212,6 +1347,7 @@ class AdminUsersTab(QWidget):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(44)
         outer.addWidget(self.table)
         self.refresh()
 
@@ -1219,6 +1355,7 @@ class AdminUsersTab(QWidget):
         users = db.get_all_users()
         self.table.setRowCount(len(users))
         for i, u in enumerate(users):
+            self.table.setRowHeight(i, 44)
             vals = [
                 str(u["user_id"]), u["username"], u["email"],
                 u["account_type"],
@@ -1232,13 +1369,19 @@ class AdminUsersTab(QWidget):
                         QColor(THEME['accent']) if v == "admin" else QColor(THEME['success']))
                 self.table.setItem(i, j, item)
 
+            # Wrap delete button in a container widget so it has padding inside the cell
             del_btn = QPushButton("Delete")
             del_btn.setObjectName("danger")
+            del_btn.setFixedHeight(30)
             uid = u["user_id"]
             del_btn.clicked.connect(lambda _, uid=uid: self._delete_user(uid))
             if u["account_type"] == "admin":
                 del_btn.setEnabled(False)
-            self.table.setCellWidget(i, 5, del_btn)
+            container = QWidget()
+            cl = QHBoxLayout(container)
+            cl.setContentsMargins(8, 6, 8, 6)
+            cl.addWidget(del_btn)
+            self.table.setCellWidget(i, 5, container)
 
     def _add_user(self):
         username = self.f_username.text().strip()
@@ -1272,8 +1415,9 @@ class AppWindow(QMainWindow):
         self.is_admin = user["account_type"] == "admin"
         self.setWindowTitle(
             f"BFRB Detector  —  {'Admin' if self.is_admin else user['username']}")
-        self.setMinimumSize(1180, 740)
+        self.setMinimumSize(1280, 800)
         self.setStyleSheet(APP_STYLE)
+        self.setWindowIcon(QIcon(make_app_icon()))
         self._build()
 
     def _build(self):
@@ -1299,7 +1443,7 @@ class AppWindow(QMainWindow):
         user_lbl = QLabel(f"  {self.user['username']}  ({self.user['email']})")
         user_lbl.setStyleSheet(f"color:{THEME['subtext']}; font-size:12px;")
         logout_btn = QPushButton("Log out")
-        logout_btn.setFixedWidth(80)
+        logout_btn.setFixedWidth(110)
         logout_btn.clicked.connect(self._logout)
         tb.addWidget(logo); tb.addWidget(role_badge); tb.addWidget(user_lbl)
         tb.addStretch(); tb.addWidget(logout_btn)
@@ -1362,8 +1506,9 @@ class LoginWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("BFRB Detector — Login")
-        self.setFixedSize(440, 520)
+        self.setFixedSize(460, 540)
         self.setStyleSheet(APP_STYLE)
+        self.setWindowIcon(QIcon(make_app_icon()))
         self._build()
 
     def _build(self):
@@ -1371,7 +1516,7 @@ class LoginWindow(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
 
         # Background panel
-        card = QWidget(); card.setFixedSize(440, 520)
+        card = QWidget(); card.setFixedSize(460, 540)
         card.setStyleSheet(
             f"background:{THEME['panel']}; border-radius:0px;")
         cl = QVBoxLayout(card)
@@ -1455,6 +1600,7 @@ class LoginWindow(QWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setWindowIcon(QIcon(make_app_icon()))
     win = LoginWindow()
     win.show()
     sys.exit(app.exec_())
