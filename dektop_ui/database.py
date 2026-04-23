@@ -8,7 +8,7 @@ Default admin: admin@bfrb.com / Admin1234!
 """
 
 import sqlite3
-import hashlib
+import bcrypt
 import os
 import json
 from datetime import datetime
@@ -18,15 +18,12 @@ DB_PATH = Path(__file__).parent / "bfrb.db"
 
 
 def _hash_password(password: str) -> str:
-    salt = os.urandom(16).hex()
-    hashed = hashlib.sha256((salt + password).encode()).hexdigest()
-    return f"{salt}:{hashed}"
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 
 def _verify_password(password: str, stored: str) -> bool:
     try:
-        salt, hashed = stored.split(":", 1)
-        return hashlib.sha256((salt + password).encode()).hexdigest() == hashed
+        return bcrypt.checkpw(password.encode(), stored.encode())
     except Exception:
         return False
 
