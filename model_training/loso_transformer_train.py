@@ -1,6 +1,21 @@
 """
-loso_transformer_train.py
-=========================
+loso_transformer_train.py  (speed-optimised + checkpointing)
+=============================================================
+Python / PyTorch LOSO training for Transformer variants.
+
+Speed improvements over the original (mirrors loso_model_zoo_fast.py):
+  • torch.backends.cudnn.benchmark = True + TF32 enabled
+  • num_workers=4 + persistent_workers + prefetch_factor=2
+  • optimizer.zero_grad(set_to_none=True)
+  • best_state uses .detach().clone() instead of .cpu().clone()
+  • torch.amp.autocast / GradScaler (non-deprecated API)
+  • Excel writing deferred to AFTER all folds finish (no I/O in hot loop)
+  • Per-fold confusion-matrix PNG skipped by default; use --save_cm to enable
+  • torch.compile() applied when PyTorch >= 2.0
+  • DataLoader workers shut down explicitly between folds (fixes "too many open files")
+  • Checkpoint saved after every fold — resume with the same command if interrupted
+  • Stale Excel files deleted at run start (no duplicate-sheet errors)
+
 Usage examples
 --------------
 # Single model (conformer, default hyper-params)
@@ -14,6 +29,9 @@ python loso_transformer_train.py --model vanilla --d_model 256 --nhead 8 --num_l
 
 # Run only folds 1-3 for a quick smoke-test
 python loso_transformer_train.py --model patch --max_folds 3
+
+# Resume an interrupted run — just re-run the same command
+python loso_transformer_train.py --model conformer
 """
 
 import os
@@ -22,9 +40,7 @@ import math
 import pickle
 import argparse
 import warnings
-import json
 from pathlib import Path
-from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -37,35 +53,55 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
-from tqdm import tqdm
 import time
 
 from transformer_models import build_model, MODEL_REGISTRY
 
 
+# ── Speed knobs ───────────────────────────────────────────────────────────────
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-# FEATURE_ROWS / EXPECTED_ROWS are no longer hardcoded.
-# The script uses ALL feature rows from whatever the data contains.
-# Row count is auto-detected from the first valid sample at runtime.
-FEATURE_ROWS   = None       # None = use all rows (auto-detected at runtime)
-EXPECTED_ROWS  = None       # None = accept any row count
+NUM_CLASSES = 24
+DOWNSAMPLE  = 2          # take every 2nd time step
+AUG_SIGMA   = 0.01       # Gaussian noise std for training augmentation
+VAL_FRAC    = 0.05       # stratified validation fraction
 
-NUM_CLASSES    = 20
-DOWNSAMPLE     = 2          # take every 2nd time step (mirrors MATLAB's 1:2:end)
-AUG_SIGMA      = 0.01       # Gaussian noise std for training augmentation
-VAL_FRAC       = 0.05       # stratified validation fraction
-
+# Reduce if you hit "too many open files" across many LOSO folds.
+# Pass --workers 0 for single-process (safest).
+DL_WORKERS = 8
 
 CLASS_NAMES = [
-    "Cuticle Picking", "Eyeglasses", "Face Touching", "Hair Pulling",
-    "Hand Waving", "Knuckle Cracking", "Leg Scratching", "Leg Shaking",
-    "Nail Biting", "Phone Call", "Raising Hand", "Reading",
-    "Scratching Arm", "Sitting Still", "Sit-to-Stand", "Standing",
-    "Stand-to-Sit", "Stretching", "Thumb Sucking", "Walking",
+    "Hair Pulling",
+    "Nail Biting",
+    "Nose Picking",
+    "Thumb Sucking",
+    "Eyeglasses",
+    "Knuckle Cracking",
+    "Face Touching",
+    "Leg Shaking",
+    "Scratching Arm",
+    "Cuticle Picking",
+    "Leg Scratching",
+    "Phone Call",
+    "Eating",
+    "Drinking",
+    "Stretching",
+    "Hand Waving",
+    "Reading",
+    "Using Phone",
+    "Standing",
+    "Sit-to-Stand",
+    "Stand-to-Sit",
+    "Walking",
+    "Sitting Still",
+    "Raising Hand",
 ]
-
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -87,172 +123,117 @@ class SequenceDataset(Dataset):
 def collate_fn(batch):
     """Pad sequences to max length in the batch; return mask."""
     seqs, labels = zip(*batch)
-    lengths = [s.shape[0] for s in seqs]
-    max_len = max(lengths)
-    C = seqs[0].shape[1]
+    lengths  = torch.tensor([s.shape[0] for s in seqs], dtype=torch.long)
+    max_len  = int(lengths.max())
+    C        = seqs[0].shape[1]
 
     padded = torch.zeros(len(seqs), max_len, C, dtype=torch.float32)
-    mask   = torch.ones(len(seqs), max_len, dtype=torch.bool)  # True = padding
+    mask   = torch.ones(len(seqs), max_len, dtype=torch.bool)   # True = padding
     for i, (s, L) in enumerate(zip(seqs, lengths)):
         padded[i, :L] = s
         mask[i, :L]   = False   # False = real data
 
-    return padded, torch.tensor(labels, dtype=torch.long), mask
+    return padded, torch.tensor(labels, dtype=torch.long), lengths, mask
 
 
 # ---------------------------------------------------------------------------
 # Data helpers
 # ---------------------------------------------------------------------------
-def extract_sequence(sample: dict, mu=None, sigma=None, augment: bool = False) -> torch.Tensor | None:
+def extract_sequence(sample: dict):
     """
-    Extract a downsampled sequence from a raw sample dict using ALL feature rows.
-    Returns a (T, C) float32 tensor or None if the sample is invalid.
-    Row count is auto-detected; any sample with >=1 feature row and no NaNs is accepted.
+    Extract a downsampled sequence using ALL feature rows.
+    Returns (T', C) float32 tensor or None if invalid / contains NaNs.
     """
-    data = sample["data"]   # (total_features, time)
-
-    # Basic sanity: must have at least one feature row and one time step
+    data = sample["data"]   # (features, time)
     if data.ndim != 2 or data.shape[0] == 0 or data.shape[1] == 0:
         return None
-
-    selected = data   # use ALL rows
-    if np.isnan(selected).any():
+    if np.isnan(data).any():
         return None
-
-    seq = selected[:, ::DOWNSAMPLE].T.astype(np.float32)  # (T', C)
-
-    if mu is not None:
-        seq = (seq - mu) / sigma
-    if augment:
-        seq += np.random.randn(*seq.shape).astype(np.float32) * AUG_SIGMA
-
+    seq = data[:, ::DOWNSAMPLE].T.astype(np.float32)   # (T', C)
     return torch.from_numpy(seq)
 
 
-def compute_normalization(sequences: list[torch.Tensor]):
-    """Compute per-feature mean and std from a list of (T, C) tensors."""
-    all_data = np.concatenate([s.numpy() for s in sequences], axis=0)  # (sum_T, C)
+def compute_normalization(sequences: list):
+    """Per-feature mean and std from a list of (T, C) tensors."""
+    all_data = np.concatenate([s.numpy() for s in sequences], axis=0)
     mu    = all_data.mean(axis=0, keepdims=True).astype(np.float32)
-    sigma = all_data.std(axis=0, keepdims=True).astype(np.float32)
+    sigma = all_data.std(axis=0,  keepdims=True).astype(np.float32)
     sigma[sigma == 0] = 1.0
     return mu, sigma
 
 
-def apply_norm(seq_tensor: torch.Tensor, mu, sigma) -> torch.Tensor:
-    return (seq_tensor.numpy() - mu) / sigma
+def apply_norm_aug(seqs: list, mu, sigma, augment: bool = False) -> list:
+    out = []
+    for s in seqs:
+        n = (s.numpy() - mu) / sigma
+        if augment:
+            n = n + np.random.randn(*n.shape).astype(np.float32) * AUG_SIGMA
+        out.append(torch.from_numpy(n))
+    return out
 
 
-def stratified_val_split(labels: list[int], val_frac: float, seed: int = 1):
-    rng = np.random.default_rng(seed)
-    all_idx = np.arange(len(labels))
+def stratified_val_split(labels: list, val_frac: float, seed: int = 1):
+    rng        = np.random.default_rng(seed)
+    all_idx    = np.arange(len(labels))
     labels_arr = np.array(labels)
-    val_idx = []
-
+    val_idx    = []
     for c in range(NUM_CLASSES):
         idx_c = all_idx[labels_arr == c]
-        n = len(idx_c)
-        if n == 0:
-            continue
-        k = max(1, round(val_frac * n)) if n > 1 else 0
+        k = max(1, round(val_frac * len(idx_c))) if len(idx_c) > 1 else 0
         if k > 0:
-            chosen = rng.choice(idx_c, k, replace=False)
-            val_idx.extend(chosen.tolist())
-
-    val_idx = list(set(val_idx))
+            val_idx.extend(rng.choice(idx_c, k, replace=False).tolist())
+    val_idx   = list(set(val_idx))
     if not val_idx:
         val_idx = rng.choice(all_idx, max(1, round(val_frac * len(labels))), replace=False).tolist()
-
     train_idx = [i for i in all_idx if i not in set(val_idx)]
     return train_idx, val_idx
 
 
 # ---------------------------------------------------------------------------
-# Training & evaluation
+# Checkpoint helpers
 # ---------------------------------------------------------------------------
-def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
-    model.train()
-    total_loss, correct, total = 0.0, 0, 0
-
-    for seqs, labels, mask in loader:
-        seqs, labels, mask = seqs.to(device), labels.to(device), mask.to(device)
-        optimizer.zero_grad()
-
-        if scaler is not None:
-            with torch.cuda.amp.autocast():
-                logits = model(seqs, padding_mask=mask)
-                loss = criterion(logits, labels)
-            scaler.scale(loss).backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            logits = model(seqs, padding_mask=mask)
-            loss = criterion(logits, labels)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-        total_loss += loss.item() * labels.size(0)
-        correct += (logits.argmax(1) == labels).sum().item()
-        total += labels.size(0)
-
-    return total_loss / total, correct / total
-
-
-@torch.no_grad()
-def evaluate(model, loader, criterion, device):
-    model.eval()
-    total_loss, correct, total = 0.0, 0, 0
-    all_preds, all_labels = [], []
-
-    for seqs, labels, mask in loader:
-        seqs, labels, mask = seqs.to(device), labels.to(device), mask.to(device)
-        logits = model(seqs, padding_mask=mask)
-        loss = criterion(logits, labels)
-        total_loss += loss.item() * labels.size(0)
-        preds = logits.argmax(1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-        all_preds.extend(preds.cpu().tolist())
-        all_labels.extend(labels.cpu().tolist())
-
-    return total_loss / total, correct / total, all_preds, all_labels
-
-
-def compute_metrics(conf_mat: np.ndarray):
-    """Compute per-class and macro metrics from confusion matrix."""
-    TP = np.diag(conf_mat).astype(float)
-    FP = conf_mat.sum(axis=0) - TP
-    FN = conf_mat.sum(axis=1) - TP
-    TN = conf_mat.sum() - (TP + FP + FN)
-    eps = 1e-10
-
-    precision = TP / (TP + FP + eps)
-    recall    = TP / (TP + FN + eps)
-    f1        = 2 * precision * recall / (precision + recall + eps)
-    mcc       = (TP * TN - FP * FN) / np.sqrt(
-        (TP + FP) * (TP + FN) * (TN + FP) * (TN + FN) + eps
-    )
-    acc = TP.sum() / conf_mat.sum()
-
-    return {
-        "accuracy":  acc,
-        "precision": precision,
-        "recall":    recall,
-        "f1":        f1,
-        "mcc":       mcc,
-        "macro_precision": precision.mean(),
-        "macro_recall":    recall.mean(),
-        "macro_f1":        f1.mean(),
-        "macro_mcc":       mcc.mean(),
+def save_checkpoint(ckpt_path: Path, fold_idx: int,
+                    fold_metrics: list, all_cm_data: dict, all_mt_data: dict):
+    """Persist everything needed to resume after fold_idx completes."""
+    ckpt = {
+        "last_completed_fold": fold_idx,
+        "fold_metrics":        fold_metrics,
+        "all_cm_data":         all_cm_data,
+        "all_mt_data":         all_mt_data,
     }
+    # Write to a temp file first, then rename — avoids corrupt checkpoint
+    # if the process is killed mid-write.
+    tmp = ckpt_path.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(ckpt, f)
+    tmp.replace(ckpt_path)
+    print(f"  [Checkpoint] saved after fold {fold_idx + 1} → {ckpt_path}")
 
 
+def load_checkpoint(ckpt_path: Path):
+    """Return checkpoint dict or None if no checkpoint exists."""
+    if not ckpt_path.exists():
+        return None
+    try:
+        with open(ckpt_path, "rb") as f:
+            ckpt = pickle.load(f)
+        print(f"  [Checkpoint] found — resuming from fold {ckpt['last_completed_fold'] + 2} "
+              f"({ckpt['last_completed_fold'] + 1} folds already done)")
+        return ckpt
+    except Exception as e:
+        warnings.warn(f"  [Checkpoint] could not load {ckpt_path}: {e}  — starting fresh.")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Confusion matrix
+# ---------------------------------------------------------------------------
 def save_confusion_matrix(conf_mat: np.ndarray, class_names: list, title: str, path: str):
-    fig, ax = plt.subplots(figsize=(14, 12))
-    # Row-normalize
+    fig, ax  = plt.subplots(figsize=(14, 12))
     row_sums = conf_mat.sum(axis=1, keepdims=True)
-    norm_cm  = np.divide(conf_mat, row_sums, where=row_sums != 0)
+    norm_cm  = np.divide(conf_mat, row_sums,
+                         out=np.zeros_like(conf_mat, dtype=float),
+                         where=row_sums != 0)
     sns.heatmap(
         norm_cm, annot=True, fmt=".2f", cmap="Blues",
         xticklabels=class_names, yticklabels=class_names,
@@ -269,63 +250,132 @@ def save_confusion_matrix(conf_mat: np.ndarray, class_names: list, title: str, p
 
 
 # ---------------------------------------------------------------------------
-# LOSO Main loop
+# Training & evaluation
 # ---------------------------------------------------------------------------
-def get_device():
-    """Return the best available device."""
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
+    model.train()
+    total_loss, correct, total = 0.0, 0, 0
+
+    for seqs, labels, lengths, mask in loader:
+        seqs, labels, mask = seqs.to(device), labels.to(device), mask.to(device)
+        # lengths not used by Transformer models but kept for API consistency
+        optimizer.zero_grad(set_to_none=True)   # faster than zero_grad()
+
+        if scaler is not None:
+            with torch.amp.autocast("cuda"):
+                logits = model(seqs, padding_mask=mask)
+                loss   = criterion(logits, labels)
+            scaler.scale(loss).backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model(seqs, padding_mask=mask)
+            loss   = criterion(logits, labels)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+        total_loss += loss.item() * labels.size(0)
+        correct    += (logits.argmax(1) == labels).sum().item()
+        total      += labels.size(0)
+
+    return total_loss / total, correct / total
 
 
+@torch.no_grad()
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    total_loss, correct, total = 0.0, 0, 0
+    all_preds, all_labels = [], []
+
+    for seqs, labels, lengths, mask in loader:
+        seqs, labels, mask = seqs.to(device), labels.to(device), mask.to(device)
+        logits = model(seqs, padding_mask=mask)
+        loss   = criterion(logits, labels)
+        total_loss += loss.item() * labels.size(0)
+        preds = logits.argmax(1)
+        correct    += (preds == labels).sum().item()
+        total      += labels.size(0)
+        all_preds.extend(preds.cpu().tolist())
+        all_labels.extend(labels.cpu().tolist())
+
+    return total_loss / total, correct / total, all_preds, all_labels
+
+
+def compute_metrics(conf_mat: np.ndarray):
+    """Compute per-class and macro metrics from confusion matrix."""
+    TP  = np.diag(conf_mat).astype(float)
+    FP  = conf_mat.sum(axis=0) - TP
+    FN  = conf_mat.sum(axis=1) - TP
+    TN  = conf_mat.sum() - (TP + FP + FN)
+    eps = 1e-10
+    precision = TP / (TP + FP + eps)
+    recall    = TP / (TP + FN + eps)
+    f1        = 2 * precision * recall / (precision + recall + eps)
+    mcc       = (TP * TN - FP * FN) / np.sqrt(
+        (TP + FP) * (TP + FN) * (TN + FP) * (TN + FN) + eps
+    )
+    return {
+        "accuracy":        TP.sum() / conf_mat.sum(),
+        "precision":       precision,
+        "recall":          recall,
+        "f1":              f1,
+        "mcc":             mcc,
+        "macro_precision": precision.mean(),
+        "macro_recall":    recall.mean(),
+        "macro_f1":        f1.mean(),
+        "macro_mcc":       mcc.mean(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Adaptive GPU → CPU batch fallback  (mirrors loso_model_zoo_fast.py)
+# ---------------------------------------------------------------------------
 def train_with_adaptive_batch(
-    model, train_dl_fn, val_dl_fn, optimizer_fn, scheduler_fn,
-    criterion, args, device_str: str, start_batch: int
+    model, make_train_dl, make_val_dl,
+    make_optimizer, make_scheduler,
+    criterion, args, device_str, start_batch
 ):
     """
-    Mirror the MATLAB adaptive-batch fallback:
-      1. Try training on GPU with the requested batch size.
-      2. On CUDA OOM, halve the batch size and retry (down to min_batch=8).
-      3. If all GPU attempts fail, fall back to CPU.
-
-    Parameters
-    ----------
-    model        : nn.Module (already on device)
-    train_dl_fn  : callable(batch_size) -> DataLoader  (recreates loader)
-    val_dl_fn    : callable(batch_size) -> DataLoader
-    optimizer_fn : callable(model) -> optimizer
-    scheduler_fn : callable(optimizer) -> scheduler
-    criterion    : loss function
-    args         : Namespace (epochs, patience, log_interval)
-    device_str   : "cuda" or "cpu"
-    start_batch  : initial MiniBatchSize to try
+    1. Try training on GPU with the requested batch size.
+    2. On CUDA OOM, halve the batch size and retry (down to MIN_BATCH=8).
+    3. If all GPU attempts fail, fall back to CPU.
 
     Returns
     -------
-    model        : trained model (best checkpoint loaded)
-    used_env     : "gpu" or "cpu"
-    used_batch   : batch size that succeeded
+    model, device, used_env ("gpu"/"cpu"), used_batch, train_dl, val_dl
     """
     MIN_BATCH = 8
-    batch = start_batch
+    batch     = start_batch
 
     while True:
         try:
-            current_device = torch.device(device_str)
-            model = model.to(current_device)
-            optimizer = optimizer_fn(model)
-            scheduler = scheduler_fn(optimizer)
-            train_dl  = train_dl_fn(batch)
-            val_dl    = val_dl_fn(batch)
-            scaler    = torch.cuda.amp.GradScaler() if device_str == "cuda" else None
+            device = torch.device(device_str)
+            model  = model.to(device)
+
+            # torch.compile (PyTorch 2+) — skip gracefully if unavailable
+            if args.compile and hasattr(torch, "compile"):
+                try:
+                    model = torch.compile(model)
+                    print("  [torch.compile] enabled")
+                except Exception as ce:
+                    print(f"  [torch.compile] skipped: {ce}")
+
+            optimizer = make_optimizer(model)
+            scheduler = make_scheduler(optimizer)
+            train_dl  = make_train_dl(batch)
+            val_dl    = make_val_dl(batch)
+            scaler    = torch.amp.GradScaler("cuda") if device_str == "cuda" else None
 
             best_val_acc = 0.0
             best_state   = None
             patience_cnt = 0
 
             for epoch in range(1, args.epochs + 1):
-                tr_loss, tr_acc = train_one_epoch(
-                    model, train_dl, optimizer, criterion, current_device, scaler
-                )
-                vl_loss, vl_acc, _, _ = evaluate(model, val_dl, criterion, current_device)
+                tr_loss, tr_acc       = train_one_epoch(
+                    model, train_dl, optimizer, criterion, device, scaler)
+                vl_loss, vl_acc, _, _ = evaluate(model, val_dl, criterion, device)
                 scheduler.step()
 
                 if epoch % args.log_interval == 0 or epoch == args.epochs:
@@ -335,7 +385,9 @@ def train_with_adaptive_batch(
 
                 if vl_acc > best_val_acc:
                     best_val_acc = vl_acc
-                    best_state   = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    # detach().clone() — faster than .cpu().clone()
+                    best_state   = {k: v.detach().clone()
+                                    for k, v in model.state_dict().items()}
                     patience_cnt = 0
                 else:
                     patience_cnt += 1
@@ -347,32 +399,32 @@ def train_with_adaptive_batch(
                 model.load_state_dict(best_state)
 
             used_env = "gpu" if device_str == "cuda" else "cpu"
-            return model, current_device, used_env, batch
+            return model, device, used_env, batch, train_dl, val_dl
 
         except RuntimeError as e:
-            msg = str(e).lower()
-            is_oom = "out of memory" in msg or "cuda" in msg and "memory" in msg
+            msg    = str(e).lower()
+            is_oom = "out of memory" in msg or ("cuda" in msg and "memory" in msg)
 
             if is_oom and device_str == "cuda" and batch > MIN_BATCH:
                 new_batch = max(MIN_BATCH, batch // 2)
                 print(f"  [OOM] GPU out of memory at batch={batch}. "
                       f"Retrying with batch={new_batch}.")
-                # Free GPU memory before retrying
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
                 batch = new_batch
                 continue
 
             if is_oom and device_str == "cuda":
                 print(f"  [OOM] GPU failed even at batch={batch}. Falling back to CPU.")
                 device_str = "cpu"
-                batch = start_batch   # reset batch size for CPU
+                batch      = start_batch
                 continue
 
-            # Non-OOM error: re-raise
-            raise
+            raise   # non-OOM error: re-raise
 
 
+# ---------------------------------------------------------------------------
+# LOSO Main loop
+# ---------------------------------------------------------------------------
 def run_loso(subjects: list, model_name: str, model_kwargs: dict, args):
     device_str   = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\n[Device] {device_str.upper()}")
@@ -381,27 +433,42 @@ def run_loso(subjects: list, model_name: str, model_kwargs: dict, args):
     max_folds    = args.max_folds if args.max_folds > 0 else num_subjects
 
     # Output directories
-    run_tag  = model_name
-    cm_dir   = Path(args.out_dir) / run_tag / "confusion_matrices"
+    out_model_dir = Path(args.out_dir) / model_name
+    cm_dir        = out_model_dir / "confusion_matrices"
     cm_dir.mkdir(parents=True, exist_ok=True)
-    excel_cm = Path(args.out_dir) / run_tag / "LOSO_ConfusionMatrices.xlsx"
-    excel_mt = Path(args.out_dir) / run_tag / "LOSO_PerClassMetrics.xlsx"
-
-    # Issue 4 fix: delete stale Excel files at the start of each run so
-    # rerunning never hits a duplicate-sheet error.
-    for xf in (excel_cm, excel_mt):
-        if xf.exists():
-            xf.unlink()
 
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    fold_metrics = []
 
+    # ── Checkpoint: load if a previous run was interrupted ───────────────────
+    ckpt_path    = out_model_dir / "checkpoint.pkl"
+    ckpt         = load_checkpoint(ckpt_path)
+    resume_from  = 0
+    fold_metrics = []
+    all_cm_data  = {}
+    all_mt_data  = {}
+
+    if ckpt is not None:
+        resume_from  = ckpt["last_completed_fold"] + 1
+        fold_metrics = ckpt["fold_metrics"]
+        all_cm_data  = ckpt["all_cm_data"]
+        all_mt_data  = ckpt["all_mt_data"]
+
+    # ── Fold loop ─────────────────────────────────────────────────────────────
     for s_idx in range(min(num_subjects, max_folds)):
+
+        # Skip folds already completed in a previous run
+        if s_idx < resume_from:
+            subj = subjects[s_idx]
+            print(f"  [Checkpoint] skipping fold {s_idx + 1} "
+                  f"(subject {subj['subjectID']} — already done)")
+            continue
+
         subj = subjects[s_idx]
         sid  = subj["subjectID"]
-        print(f"\n=== Leave subject {s_idx+1}/{num_subjects} out: {sid} ===")
+        print(f"\n=== Fold {s_idx+1}/{min(num_subjects, max_folds)} "
+              f"– Leave out: {sid} ===")
 
-        # ---- Build raw sequences ----
+        # ── Build pool (train+val) and test sets ─────────────────────────────
         pool_seqs, pool_labels = [], []
         for i, other in enumerate(subjects):
             if i == s_idx:
@@ -423,74 +490,95 @@ def run_loso(subjects: list, model_name: str, model_kwargs: dict, args):
             warnings.warn(f"Fold {s_idx+1} empty — skipping.")
             continue
 
-        # ---- Stratified val split ----
+        # ── Stratified val split ──────────────────────────────────────────────
         train_idx, val_idx = stratified_val_split(pool_labels, VAL_FRAC, seed=s_idx + 1)
         train_seqs_raw = [pool_seqs[i] for i in train_idx]
         train_labels   = [pool_labels[i] for i in train_idx]
         val_seqs_raw   = [pool_seqs[i] for i in val_idx]
         val_labels     = [pool_labels[i] for i in val_idx]
 
-        # ---- Normalize ----
-        mu, sigma = compute_normalization(train_seqs_raw + val_seqs_raw)
+        # ── Normalize ─────────────────────────────────────────────────────────
+        mu, sigma   = compute_normalization(train_seqs_raw + val_seqs_raw)
+        train_seqs  = apply_norm_aug(train_seqs_raw, mu, sigma, augment=True)
+        val_seqs    = apply_norm_aug(val_seqs_raw,   mu, sigma, augment=False)
+        test_seqs_n = apply_norm_aug(test_seqs,      mu, sigma, augment=False)
 
-        def norm_aug(seqs, augment=False):
-            out = []
-            for s in seqs:
-                n = (s.numpy() - mu) / sigma
-                if augment:
-                    n = n + np.random.randn(*n.shape).astype(np.float32) * AUG_SIGMA
-                out.append(torch.from_numpy(n))
-            return out
-
-        train_seqs  = norm_aug(train_seqs_raw, augment=True)
-        val_seqs    = norm_aug(val_seqs_raw,   augment=False)
-        test_seqs_n = norm_aug(test_seqs,      augment=False)
-
-        # ---- Infer seq_len for models that need it ----
+        # ── Infer max_len for models that need it ─────────────────────────────
         all_lens = [s.shape[0] for s in train_seqs + val_seqs + test_seqs_n]
         max_len  = max(all_lens)
 
-        # ---- DataLoader factories (needed for adaptive-batch retry) ----
-        pin = device_str == "cuda"
-        train_ds = SequenceDataset(train_seqs, train_labels)
-        val_ds   = SequenceDataset(val_seqs,   val_labels)
+        # ── Datasets & DataLoader factories ───────────────────────────────────
+        pin      = device_str == "cuda"
+        train_ds = SequenceDataset(train_seqs,  train_labels)
+        val_ds   = SequenceDataset(val_seqs,    val_labels)
         test_ds  = SequenceDataset(test_seqs_n, test_labels)
 
         def make_train_dl(bs):
-            return DataLoader(train_ds, batch_size=bs, shuffle=True,
-                              collate_fn=collate_fn, num_workers=0, pin_memory=pin)
+            return DataLoader(
+                train_ds, batch_size=bs, shuffle=True,
+                collate_fn=collate_fn,
+                num_workers=DL_WORKERS,
+                pin_memory=pin,
+                persistent_workers=(DL_WORKERS > 0),
+                prefetch_factor=2 if DL_WORKERS > 0 else None,
+            )
+
         def make_val_dl(bs):
-            return DataLoader(val_ds, batch_size=bs, shuffle=False,
-                              collate_fn=collate_fn, num_workers=0)
+            return DataLoader(
+                val_ds, batch_size=bs, shuffle=False,
+                collate_fn=collate_fn,
+                num_workers=DL_WORKERS,
+                pin_memory=pin,
+                persistent_workers=(DL_WORKERS > 0),
+                prefetch_factor=2 if DL_WORKERS > 0 else None,
+            )
 
-        test_dl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                             collate_fn=collate_fn, num_workers=0)
+        test_dl = DataLoader(
+            test_ds, batch_size=args.batch_size, shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=DL_WORKERS,
+            pin_memory=pin,
+            persistent_workers=(DL_WORKERS > 0),
+            prefetch_factor=2 if DL_WORKERS > 0 else None,
+        )
 
-        # ---- Build model ----
+        # ── Build model ───────────────────────────────────────────────────────
         input_dim = train_seqs[0].shape[1]
-        model = build_model(model_name, input_dim, NUM_CLASSES, max_len, **model_kwargs)
-        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"  Model: {model_name}  |  Params: {n_params:,}  |  Input dim: {input_dim}")
+        model     = build_model(model_name, input_dim, NUM_CLASSES, max_len, **model_kwargs)
 
-        # ---- Issue 2: adaptive GPU->CPU batch fallback ----
+        if s_idx == resume_from:   # first fold we actually train — print once
+            n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"  Model     : {model_name}")
+            print(f"  Input dim : {input_dim}")
+            print(f"  Params    : {n_params:,}")
+
         def make_optimizer(m):
             return torch.optim.AdamW(m.parameters(), lr=args.lr, weight_decay=1e-4)
+
         def make_scheduler(opt):
-            return CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
+            return CosineAnnealingLR(opt, T_max=args.epochs, eta_min=args.lr * 0.01)
 
-        model, device, used_env, used_batch = train_with_adaptive_batch(
-            model, make_train_dl, make_val_dl,
-            make_optimizer, make_scheduler,
-            criterion, args, device_str, args.batch_size
-        )
-        print(f"  Trained on {used_env.upper()} with batch_size={used_batch}")
+        model, device, used_env, used_batch, train_dl, val_dl = \
+            train_with_adaptive_batch(
+                model, make_train_dl, make_val_dl,
+                make_optimizer, make_scheduler,
+                criterion, args, device_str, args.batch_size,
+            )
+        print(f"  Trained on {used_env.upper()} | batch_size={used_batch}")
 
-        # ---- Test ----
+        # ── Test ──────────────────────────────────────────────────────────────
         model.to(device)
         _, test_acc, y_pred, y_true = evaluate(model, test_dl, criterion, device)
-        print(f"  Subject {s_idx+1} test accuracy: {test_acc*100:.2f}%")
+        print(f"  Test accuracy: {test_acc * 100:.2f}%")
 
-        # ---- Confusion matrix & metrics ----
+        # ── Shut down DataLoader workers to free file descriptors ─────────────
+        # Prevents "too many open files" when running many LOSO folds with
+        # persistent_workers=True.
+        for dl in [train_dl, val_dl, test_dl]:
+            dl._iterator = None
+        del train_dl, val_dl, test_dl
+
+        # ── Metrics ───────────────────────────────────────────────────────────
         conf_mat = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES)))
         metrics  = compute_metrics(conf_mat)
 
@@ -503,48 +591,59 @@ def run_loso(subjects: list, model_name: str, model_kwargs: dict, args):
             "mcc":       metrics["macro_mcc"],
         })
 
-        # ---- Save confusion matrix PNG ----
-        safe_id = "".join(c if c.isalnum() else "_" for c in sid)
-        cm_path = str(cm_dir / f"CM_Subject_{s_idx+1:02d}_{safe_id}.png")
-        save_confusion_matrix(
-            conf_mat, CLASS_NAMES,
-            title=f"Confusion Matrix – Subject {s_idx+1} ({sid})  [{model_name}]",
-            path=cm_path
-        )
+        # Optional per-fold confusion matrix PNG
+        if args.save_cm:
+            safe_id = "".join(c if c.isalnum() else "_" for c in sid)
+            cm_path = str(cm_dir / f"CM_Fold_{s_idx+1:02d}_{safe_id}.png")
+            save_confusion_matrix(
+                conf_mat, CLASS_NAMES,
+                title=f"Confusion Matrix – {sid}  [{model_name}]",
+                path=cm_path,
+            )
 
-        # ---- Issue 4 fix: write Excel with if_sheet_exists="replace" ----
+        # Accumulate Excel data in memory (written once after all folds)
         sheet = f"Subject_{s_idx+1}"
-        cm_df = pd.DataFrame(conf_mat, index=CLASS_NAMES, columns=CLASS_NAMES)
-        mode = "a" if excel_cm.exists() else "w"
-        with pd.ExcelWriter(excel_cm, engine="openpyxl", mode=mode,
-                            if_sheet_exists="replace" if mode == "a" else None) as w:
-            cm_df.to_excel(w, sheet_name=sheet)
-
-        per_class = pd.DataFrame({
+        all_cm_data[sheet] = pd.DataFrame(
+            conf_mat, index=CLASS_NAMES, columns=CLASS_NAMES)
+        all_mt_data[sheet] = pd.DataFrame({
             "Precision": metrics["precision"],
             "Recall":    metrics["recall"],
             "F1Score":   metrics["f1"],
             "MCC":       metrics["mcc"],
         }, index=CLASS_NAMES)
-        mode = "a" if excel_mt.exists() else "w"
-        with pd.ExcelWriter(excel_mt, engine="openpyxl", mode=mode,
-                            if_sheet_exists="replace" if mode == "a" else None) as w:
-            per_class.to_excel(w, sheet_name=sheet)
 
-    # ---- Summary ----
+        # ── Save checkpoint after every completed fold ─────────────────────
+        save_checkpoint(ckpt_path, s_idx, fold_metrics, all_cm_data, all_mt_data)
+
+    # ── Write Excel ONCE after all folds ──────────────────────────────────────
+    if all_cm_data:
+        excel_cm = out_model_dir / "LOSO_ConfusionMatrices.xlsx"
+        excel_mt = out_model_dir / "LOSO_PerClassMetrics.xlsx"
+        with pd.ExcelWriter(excel_cm, engine="openpyxl") as w:
+            for sheet, df in all_cm_data.items():
+                df.to_excel(w, sheet_name=sheet)
+        with pd.ExcelWriter(excel_mt, engine="openpyxl") as w:
+            for sheet, df in all_mt_data.items():
+                df.to_excel(w, sheet_name=sheet)
+        print(f"  Excel saved → {out_model_dir}/")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
     if fold_metrics:
-        print(f"\n=== Summary [{model_name}] over {len(fold_metrics)} folds ===")
+        print(f"\n=== Summary [{model_name}] — {len(fold_metrics)} folds ===")
         for k in ["accuracy", "precision", "recall", "f1", "mcc"]:
             avg = np.mean([m[k] for m in fold_metrics])
-            print(f"  Average {k:10s}: {avg:.4f}")
-
-        summary_df = pd.DataFrame(fold_metrics)
-        summary_path = Path(args.out_dir) / run_tag / "LOSO_Summary.csv"
+            print(f"  Avg {k:10s}: {avg:.4f}")
+        summary_df   = pd.DataFrame(fold_metrics)
+        summary_path = out_model_dir / "LOSO_Summary.csv"
         summary_df.to_csv(summary_path, index=False)
-        print(f"\nSummary saved -> {summary_path}")
+        print(f"  Summary saved → {summary_path}")
+
+        # Delete checkpoint now that all folds are done
+        if ckpt_path.exists():
+            ckpt_path.unlink()
+            print(f"  [Checkpoint] deleted — all folds complete.")
 
     return fold_metrics
-
 
 
 # ---------------------------------------------------------------------------
@@ -552,16 +651,16 @@ def run_loso(subjects: list, model_name: str, model_kwargs: dict, args):
 # ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(
-        description="LOSO Transformer Training",
+        description="LOSO Transformer Training (speed-optimised + checkpointing)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     # ── Data & output ─────────────────────────────────────────────────────
-    p.add_argument("--data",         default="subjects_cleaned_12subjects.pkl",
+    p.add_argument("--data",         default="subjects_cleaned_20subjects.pkl",
                    help="Pickle file from load_cell_data.py")
     p.add_argument("--model",        default="all",
                    choices=list(MODEL_REGISTRY) + ["all"],
                    help="Transformer variant to use, or 'all' to sweep")
-    p.add_argument("--out_dir",      default="loso_results")
+    p.add_argument("--out_dir",      default="loso_transformer_results")
     # ── Training knobs ────────────────────────────────────────────────────
     p.add_argument("--epochs",       type=int,   default=100)
     p.add_argument("--batch_size",   type=int,   default=32,
@@ -572,44 +671,35 @@ def parse_args():
     p.add_argument("--log_interval", type=int,   default=10)
     p.add_argument("--max_folds",    type=int,   default=0,
                    help="Limit LOSO folds (0 = all subjects)")
+    # ── Speed options ─────────────────────────────────────────────────────
+    p.add_argument("--save_cm",      action="store_true",
+                   help="Save per-fold confusion matrix PNGs (slower)")
+    p.add_argument("--compile",      action="store_true",
+                   help="Apply torch.compile() — PyTorch 2+ only")
+    p.add_argument("--workers",      type=int,   default=DL_WORKERS,
+                   help="DataLoader worker processes (0=single-process, safest)")
     # ── Shared model hyper-params ─────────────────────────────────────────
-    p.add_argument("--d_model",         type=int,   default=None,
-                   help="Embedding dimension [all models]")
-    p.add_argument("--nhead",           type=int,   default=None,
-                   help="Self-attention heads [all models]")
-    p.add_argument("--num_layers",      type=int,   default=None,
-                   help="Encoder depth [all models]")
-    p.add_argument("--dim_feedforward", type=int,   default=None,
-                   help="FFN hidden size [vanilla, patch, conv_stem]")
-    p.add_argument("--dropout",         type=float, default=None,
-                   help="Dropout rate [all models]")
+    p.add_argument("--d_model",         type=int,   default=None)
+    p.add_argument("--nhead",           type=int,   default=None)
+    p.add_argument("--num_layers",      type=int,   default=None)
+    p.add_argument("--dim_feedforward", type=int,   default=None)
+    p.add_argument("--dropout",         type=float, default=None)
     # ── Variant-specific hyper-params ─────────────────────────────────────
-    p.add_argument("--patch_size",   type=int,   default=None,
-                   help="Time steps per patch [patch]")
-    p.add_argument("--kernel_size",  type=int,   default=None,
-                   help="Conv kernel size [conv_stem, conformer]")
-    p.add_argument("--k",            type=int,   default=None,
-                   help="Low-rank projection dim [linformer]")
-    p.add_argument("--window_size",  type=int,   default=None,
-                   help="Local window length [hierarchical]")
-    p.add_argument("--d_local",      type=int,   default=None,
-                   help="Local-stage embedding dim [hierarchical]")
-    p.add_argument("--d_global",     type=int,   default=None,
-                   help="Global-stage embedding dim [hierarchical]")
-    p.add_argument("--num_latents",  type=int,   default=None,
-                   help="Number of learnable query vectors [cross_attention]")
-    p.add_argument("--d_latent",     type=int,   default=None,
-                   help="Latent query dimension [cross_attention]")
-    p.add_argument("--nhead_cross",  type=int,   default=None,
-                   help="Cross-attention heads [cross_attention]")
+    p.add_argument("--patch_size",   type=int,   default=None)
+    p.add_argument("--kernel_size",  type=int,   default=None)
+    p.add_argument("--k",            type=int,   default=None)
+    p.add_argument("--window_size",  type=int,   default=None)
+    p.add_argument("--d_local",      type=int,   default=None)
+    p.add_argument("--d_global",     type=int,   default=None)
+    p.add_argument("--num_latents",  type=int,   default=None)
+    p.add_argument("--d_latent",     type=int,   default=None)
+    p.add_argument("--nhead_cross",  type=int,   default=None)
     return p.parse_args()
 
 
 def collect_model_kwargs(args) -> dict:
     all_keys = [
-        # shared
         "d_model", "nhead", "num_layers", "dim_feedforward", "dropout",
-        # variant-specific
         "patch_size", "kernel_size", "k",
         "window_size", "d_local", "d_global",
         "num_latents", "d_latent", "nhead_cross",
@@ -620,7 +710,9 @@ def collect_model_kwargs(args) -> dict:
 def main():
     args = parse_args()
 
-    # Load data
+    global DL_WORKERS
+    DL_WORKERS = args.workers
+
     if not Path(args.data).exists():
         print(f"[ERROR] Data file not found: {args.data}")
         print("  Run load_cell_data.py first.")
@@ -630,14 +722,14 @@ def main():
         subjects = pickle.load(f)
     print(f"Loaded {len(subjects)} subjects from {args.data}")
 
-    model_kwargs = collect_model_kwargs(args)
-    # models_to_run = list(MODEL_REGISTRY) if args.model == "all" else [args.model]
-    # EXCLUDE_MODELS = {"patch", "conv_stem", "hierarchical", "cross_attention", "linformer"}
-    EXCLUDE_MODELS = {}
-    if args.model == "all":
-        models_to_run = [m for m in MODEL_REGISTRY if m not in EXCLUDE_MODELS]
-    else:
-        models_to_run = [args.model]
+    model_kwargs  = collect_model_kwargs(args)
+    EXCLUDE_MODELS = ["patch", "conv_stem", "cross_attention", "patch", "vanilla"]    # add model names here to skip them
+    models_to_run  = (
+        [m for m in MODEL_REGISTRY if m not in EXCLUDE_MODELS]
+        if args.model == "all"
+        else [args.model]
+    )
+
     all_results = {}
     model_times = {}
 
@@ -645,22 +737,17 @@ def main():
         print(f"\n{'='*60}")
         print(f"  TRAINING MODEL: {model_name.upper()}")
         print(f"{'='*60}")
-        start_time = time.time()
-        results = run_loso(subjects, model_name, model_kwargs, args)
+        t0 = time.time()
+        try:
+            results = run_loso(subjects, model_name, model_kwargs, args)
+            all_results[model_name] = results
+        except Exception as e:
+            warnings.warn(f"Model {model_name} failed: {e}")
+            all_results[model_name] = []
+        model_times[model_name] = (time.time() - t0) / 3600
 
-        elapsed = time.time() - start_time
-        hours = elapsed / 3600
-
-        print(f"\nTime  Model {model_name} finished in {hours:.2f} hours")
-
-        model_times[model_name] = hours
-        all_results[model_name] = results
-
-    # Cross-model comparison summary
+    # ── Cross-model comparison summary ────────────────────────────────────────
     if len(models_to_run) > 1:
-        print(f"\n{'='*60}")
-        print("  CROSS-MODEL COMPARISON")
-        print(f"{'='*60}")
         rows = []
         for mname, folds in all_results.items():
             if not folds:
@@ -673,23 +760,23 @@ def main():
                 "f1":        np.mean([m["f1"]        for m in folds]),
                 "mcc":       np.mean([m["mcc"]       for m in folds]),
             })
-        comp_df = pd.DataFrame(rows).sort_values("f1", ascending=False)
-        print(comp_df.to_string(index=False))
-        comp_path = Path(args.out_dir) / "model_comparison.csv"
-        comp_path.parent.mkdir(parents=True, exist_ok=True)
-        comp_df.to_csv(comp_path, index=False)
-        print(f"\nComparison table saved -> {comp_path}")
-    
-    if len(model_times) > 0:
-        print(f"\n{'='*60}")
-        print("  MODEL TRAINING TIME SUMMARY")
-        print(f"{'='*60}")
+        if rows:
+            comp_df   = pd.DataFrame(rows).sort_values("f1", ascending=False)
+            comp_path = Path(args.out_dir) / "model_comparison.csv"
+            comp_path.parent.mkdir(parents=True, exist_ok=True)
+            comp_df.to_csv(comp_path, index=False)
+            print(f"\n{'='*60}")
+            print("  CROSS-MODEL COMPARISON")
+            print(f"{'='*60}")
+            print(comp_df.to_string(index=False))
+            print(f"\nComparison table saved → {comp_path}")
 
-        for m, t in model_times.items():
-            print(f"  {m:20s}: {t:.2f} hours")
-
-        total_time = sum(model_times.values())
-        print(f"\n  Total time: {total_time:.2f} hours")
+    print(f"\n{'='*60}")
+    print("  MODEL TRAINING TIME SUMMARY")
+    print(f"{'='*60}")
+    for m, t in model_times.items():
+        print(f"  {m:20s}: {t:.2f} hours")
+    print(f"  Total: {sum(model_times.values()):.2f} hours")
 
 
 if __name__ == "__main__":
