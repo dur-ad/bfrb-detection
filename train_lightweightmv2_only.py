@@ -1,7 +1,7 @@
 """
 train_lightweightmv2.py
 =======================
-1. Runs LOSO cross-validation on subjects_cleaned_11subjects.pkl
+1. Runs LOSO cross-validation on subjects_cleaned_20subjects.pkl
    → produces per-fold metrics, confusion matrices, summary CSV
 
 2. Retrains LightweightMV2 on ALL subjects / ALL samples using the
@@ -15,15 +15,29 @@ train_lightweightmv2.py
     ├── load_and_test.py
     └── README.md
 
+GPU Optimisations (mirrored from loso_model_zoo_fast.py)
+---------------------------------------------------------
+  • torch.backends.cudnn.benchmark = True
+  • TF32 enabled on Ampere+ GPUs
+  • num_workers=12 + persistent_workers + prefetch_factor=2
+  • optimizer.zero_grad(set_to_none=True)
+  • best_state uses .detach().clone()
+  • torch.amp.autocast / GradScaler (updated non-deprecated API)
+  • Excel writing deferred until after all folds
+  • Checkpoint saved after every LOSO fold (resume-safe)
+  • DataLoader workers shut down between folds (no "too many open files")
+  • torch.compile() support (PyTorch 2+)
+
 Usage
 -----
-    python train_lightweightmv2.py
-    python train_lightweightmv2.py --epochs 100 --batch_size 32
-    python train_lightweightmv2.py --skip_loso   # jump straight to retrain+export
+    python train_lightweightmv2.py --skip_loso
+    python train_lightweightmv2.py --epochs 100 --batch_size 64
+    python train_lightweightmv2.py --skip_loso --epochs 150 --batch_size 64
 """
 
 import argparse
 import os
+import pickle
 import sys
 import time
 import warnings
@@ -41,24 +55,50 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# ── Speed knobs ───────────────────────────────────────────────────────────────
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-NUM_CLASSES = 20
+NUM_CLASSES = 24
 DOWNSAMPLE  = 2
 AUG_SIGMA   = 0.01
 VAL_FRAC    = 0.05
 MODEL_NAME  = "LightweightMV2"
-OUTPUT_DIR  = "LightweightMV2_loso_results_11subjects"
+OUTPUT_DIR  = "LightweightMV2_loso_results_20subjects"
 EXPORT_DIR  = "model_export"
+DL_WORKERS  = 12
 
 CLASS_NAMES = [
-    "Cuticle Picking", "Eyeglasses", "Face Touching", "Hair Pulling",
-    "Hand Waving", "Knuckle Cracking", "Leg Scratching", "Leg Shaking",
-    "Nail Biting", "Phone Call", "Raising Hand", "Reading",
-    "Scratching Arm", "Sitting Still", "Sit-to-Stand", "Standing",
-    "Stand-to-Sit", "Stretching", "Thumb Sucking", "Walking",
+    "Hair Pulling",
+    "Nail Biting",
+    "Nose Picking",
+    "Thumb Sucking",
+    "Eyeglasses",
+    "Knuckle Cracking",
+    "Face Touching",
+    "Leg Shaking",
+    "Scratching Arm",
+    "Cuticle Picking",
+    "Leg Scratching",
+    "Phone Call",
+    "Eating",
+    "Drinking",
+    "Stretching",
+    "Hand Waving",
+    "Reading",
+    "Using Phone",
+    "Standing",
+    "Sit-to-Stand",
+    "Stand-to-Sit",
+    "Walking",
+    "Sitting Still",
+    "Raising Hand",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -191,6 +231,42 @@ def stratified_val_split(labels, val_frac, seed=1):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CHECKPOINT HELPERS  (new — matches loso_model_zoo_fast.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_checkpoint(ckpt_path: Path, fold_idx: int,
+                    fold_metrics: list, all_cm_data: dict, all_mt_data: dict):
+    """Atomically persist progress after each LOSO fold."""
+    ckpt = {
+        "last_completed_fold": fold_idx,
+        "fold_metrics":        fold_metrics,
+        "all_cm_data":         all_cm_data,
+        "all_mt_data":         all_mt_data,
+    }
+    tmp = ckpt_path.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(ckpt, f)
+    tmp.replace(ckpt_path)
+    print(f"  [Checkpoint] saved after fold {fold_idx + 1} → {ckpt_path}")
+
+
+def load_checkpoint(ckpt_path: Path):
+    """Return checkpoint dict or None if none exists."""
+    if not ckpt_path.exists():
+        return None
+    try:
+        with open(ckpt_path, "rb") as f:
+            ckpt = pickle.load(f)
+        print(f"  [Checkpoint] found — resuming from fold "
+              f"{ckpt['last_completed_fold'] + 2} "
+              f"({ckpt['last_completed_fold'] + 1} folds already done)")
+        return ckpt
+    except Exception as e:
+        warnings.warn(f"  [Checkpoint] could not load {ckpt_path}: {e} — starting fresh.")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TRAINING & EVALUATION
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -198,8 +274,12 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     for x, y, lengths, pad_mask in loader:
-        x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
+        x, y     = x.to(device), y.to(device)
+        lengths  = lengths.to(device)
+        pad_mask = pad_mask.to(device)
+
+        optimizer.zero_grad(set_to_none=True)   # faster than zero_grad()
+
         if scaler is not None:
             with torch.amp.autocast("cuda"):
                 logits = model(x)
@@ -214,6 +294,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+
         total_loss += loss.item() * y.size(0)
         correct    += (logits.argmax(1) == y).sum().item()
         total      += y.size(0)
@@ -226,9 +307,11 @@ def evaluate(model, loader, criterion, device):
     total_loss, correct, total = 0.0, 0, 0
     all_preds, all_labels = [], []
     for x, y, lengths, pad_mask in loader:
-        x, y   = x.to(device), y.to(device)
-        logits = model(x)
-        loss   = criterion(logits, y)
+        x, y     = x.to(device), y.to(device)
+        lengths  = lengths.to(device)
+        pad_mask = pad_mask.to(device)
+        logits   = model(x)
+        loss     = criterion(logits, y)
         total_loss += loss.item() * y.size(0)
         preds = logits.argmax(1)
         correct    += (preds == y).sum().item()
@@ -261,7 +344,9 @@ def compute_metrics(conf_mat):
 def save_confusion_matrix(conf_mat, class_names, title, path):
     fig, ax  = plt.subplots(figsize=(14, 12))
     row_sums = conf_mat.sum(axis=1, keepdims=True)
-    norm_cm  = np.divide(conf_mat, row_sums, where=row_sums != 0)
+    norm_cm  = np.divide(conf_mat, row_sums,
+                         out=np.zeros_like(conf_mat, dtype=float),
+                         where=row_sums != 0)
     sns.heatmap(norm_cm, annot=True, fmt=".2f", cmap="Blues",
                 xticklabels=class_names, yticklabels=class_names,
                 ax=ax, vmin=0, vmax=1)
@@ -276,14 +361,14 @@ def save_confusion_matrix(conf_mat, class_names, title, path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SHARED CORE TRAINING LOOP  (used by both LOSO folds and full retrain)
+# SHARED CORE TRAINING LOOP
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _do_train(model, make_train_dl, make_val_dl, make_optimizer, make_scheduler,
               criterion, args, device_str, start_batch, use_early_stopping=True):
     """
-    use_early_stopping=True  → LOSO mode: val split exists, save best checkpoint
-    use_early_stopping=False → retrain mode: no val set, run exactly args.epochs
+    use_early_stopping=True  → LOSO mode: val split, save best checkpoint
+    use_early_stopping=False → retrain mode: run exactly args.epochs
     """
     MIN_BATCH = 8
     batch     = start_batch
@@ -292,6 +377,15 @@ def _do_train(model, make_train_dl, make_val_dl, make_optimizer, make_scheduler,
         try:
             device    = torch.device(device_str)
             model     = model.to(device)
+
+            # torch.compile() support (PyTorch 2+)
+            if args.compile and hasattr(torch, "compile"):
+                try:
+                    model = torch.compile(model)
+                    print("  [torch.compile] enabled")
+                except Exception as ce:
+                    print(f"  [torch.compile] skipped: {ce}")
+
             optimizer = make_optimizer(model)
             scheduler = make_scheduler(optimizer)
             train_dl  = make_train_dl(batch)
@@ -315,7 +409,8 @@ def _do_train(model, make_train_dl, make_val_dl, make_optimizer, make_scheduler,
                               f"val loss {vl_loss:.4f} acc {vl_acc:.3f}")
                     if vl_acc > best_val_acc:
                         best_val_acc = vl_acc
-                        best_state   = {k: v.cpu().clone()
+                        # detach().clone() — faster than .cpu().clone()
+                        best_state   = {k: v.detach().clone()
                                         for k, v in model.state_dict().items()}
                         patience_cnt = 0
                     else:
@@ -325,16 +420,14 @@ def _do_train(model, make_train_dl, make_val_dl, make_optimizer, make_scheduler,
                                   f"(patience={args.patience})")
                             break
                 else:
-                    # Full retrain — log training progress only
                     if epoch % args.log_interval == 0 or epoch == args.epochs:
                         print(f"  Epoch {epoch:3d}/{args.epochs} | "
                               f"train loss {tr_loss:.4f}  acc {tr_acc:.3f}")
 
-            # LOSO: restore best val checkpoint; retrain: keep final weights
             if use_early_stopping and best_state is not None:
                 model.load_state_dict(best_state)
 
-            return model, device, "gpu" if device_str == "cuda" else "cpu", batch
+            return model, device, "gpu" if device_str == "cuda" else "cpu", batch, train_dl, val_dl
 
         except RuntimeError as e:
             msg    = str(e).lower()
@@ -354,27 +447,45 @@ def _do_train(model, make_train_dl, make_val_dl, make_optimizer, make_scheduler,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PHASE 1 — LOSO CROSS-VALIDATION
+# PHASE 1 — LOSO CROSS-VALIDATION  (with checkpointing)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_loso(subjects, args):
     device_str   = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"\n[Device] {device_str.upper()}")
     num_subjects = len(subjects)
     max_folds    = args.max_folds if args.max_folds > 0 else num_subjects
 
-    out_dir  = Path(args.out_dir)
-    cm_dir   = out_dir / "confusion_matrices"
+    out_dir = Path(args.out_dir)
+    cm_dir  = out_dir / "confusion_matrices"
     cm_dir.mkdir(parents=True, exist_ok=True)
-    excel_cm = out_dir / "LOSO_ConfusionMatrices.xlsx"
-    excel_mt = out_dir / "LOSO_PerClassMetrics.xlsx"
-    for xf in (excel_cm, excel_mt):
-        if xf.exists():
-            xf.unlink()
 
-    criterion    = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    # ── Checkpoint: resume if interrupted ────────────────────────────────────
+    ckpt_path    = out_dir / "checkpoint.pkl"
+    ckpt         = load_checkpoint(ckpt_path)
+    resume_from  = 0
     fold_metrics = []
+    all_cm_data  = {}
+    all_mt_data  = {}
+
+    if ckpt is not None:
+        resume_from  = ckpt["last_completed_fold"] + 1
+        fold_metrics = ckpt["fold_metrics"]
+        all_cm_data  = ckpt["all_cm_data"]
+        all_mt_data  = ckpt["all_mt_data"]
+
+    pin = device_str == "cuda"
 
     for s_idx in range(min(num_subjects, max_folds)):
+
+        if s_idx < resume_from:
+            subj = subjects[s_idx]
+            print(f"  [Checkpoint] skipping fold {s_idx + 1} "
+                  f"(subject {subj['subjectID']} — already done)")
+            continue
+
         subj = subjects[s_idx]
         sid  = subj["subjectID"]
         print(f"\n{'='*60}")
@@ -413,24 +524,40 @@ def run_loso(subjects, args):
         val_seqs    = apply_norm_aug(val_seqs_raw,   mu, sigma, augment=False)
         test_seqs_n = apply_norm_aug(test_seqs,      mu, sigma, augment=False)
 
-        pin      = device_str == "cuda"
         train_ds = SequenceDataset(train_seqs,  train_labels)
         val_ds   = SequenceDataset(val_seqs,    val_labels)
         test_ds  = SequenceDataset(test_seqs_n, test_labels)
 
         def make_train_dl(bs):
-            return DataLoader(train_ds, batch_size=bs, shuffle=True,
-                              collate_fn=collate_fn, num_workers=0, pin_memory=pin)
-        def make_val_dl(bs):
-            return DataLoader(val_ds, batch_size=bs, shuffle=False,
-                              collate_fn=collate_fn, num_workers=0)
+            return DataLoader(
+                train_ds, batch_size=bs, shuffle=True,
+                collate_fn=collate_fn, num_workers=DL_WORKERS,
+                pin_memory=pin,
+                persistent_workers=(DL_WORKERS > 0),
+                prefetch_factor=2 if DL_WORKERS > 0 else None,
+            )
 
-        test_dl    = DataLoader(test_ds, batch_size=args.batch_size,
-                                shuffle=False, collate_fn=collate_fn, num_workers=0)
+        def make_val_dl(bs):
+            return DataLoader(
+                val_ds, batch_size=bs, shuffle=False,
+                collate_fn=collate_fn, num_workers=DL_WORKERS,
+                pin_memory=pin,
+                persistent_workers=(DL_WORKERS > 0),
+                prefetch_factor=2 if DL_WORKERS > 0 else None,
+            )
+
+        test_dl = DataLoader(
+            test_ds, batch_size=args.batch_size, shuffle=False,
+            collate_fn=collate_fn, num_workers=DL_WORKERS,
+            pin_memory=pin,
+            persistent_workers=(DL_WORKERS > 0),
+            prefetch_factor=2 if DL_WORKERS > 0 else None,
+        )
+
         input_size = train_seqs[0].shape[1]
         model      = LightweightMV2(input_size=input_size, num_classes=NUM_CLASSES)
 
-        if s_idx == 0:
+        if s_idx == resume_from:
             n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print(f"  Model     : {MODEL_NAME}")
             print(f"  Input dim : {input_size}")
@@ -438,11 +565,12 @@ def run_loso(subjects, args):
 
         def make_optimizer(m):
             return torch.optim.AdamW(m.parameters(), lr=args.lr, weight_decay=1e-4)
+
         def make_scheduler(opt):
             return torch.optim.lr_scheduler.CosineAnnealingLR(
                 opt, T_max=args.epochs, eta_min=args.lr * 0.01)
 
-        model, device, used_env, used_batch = _do_train(
+        model, device, used_env, used_batch, train_dl, val_dl = _do_train(
             model, make_train_dl, make_val_dl, make_optimizer, make_scheduler,
             criterion, args, device_str, args.batch_size, use_early_stopping=True,
         )
@@ -451,6 +579,11 @@ def run_loso(subjects, args):
         model.to(device)
         _, test_acc, y_pred, y_true = evaluate(model, test_dl, criterion, device)
         print(f"  Test accuracy: {test_acc * 100:.2f}%")
+
+        # Shut down DataLoader workers to free file descriptors
+        for dl in [train_dl, val_dl, test_dl]:
+            dl._iterator = None
+        del train_dl, val_dl, test_dl
 
         conf_mat = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES)))
         metrics  = compute_metrics(conf_mat)
@@ -464,26 +597,38 @@ def run_loso(subjects, args):
             "mcc":       metrics["macro_mcc"],
         })
 
-        safe_id = "".join(c if c.isalnum() else "_" for c in sid)
-        save_confusion_matrix(
-            conf_mat, CLASS_NAMES,
-            title=f"CM – {sid}  [{MODEL_NAME}]",
-            path=str(cm_dir / f"CM_Fold_{s_idx+1:02d}_{safe_id}.png"),
-        )
+        if args.save_cm:
+            safe_id = "".join(c if c.isalnum() else "_" for c in sid)
+            save_confusion_matrix(
+                conf_mat, CLASS_NAMES,
+                title=f"CM – {sid}  [{MODEL_NAME}]",
+                path=str(cm_dir / f"CM_Fold_{s_idx+1:02d}_{safe_id}.png"),
+            )
 
+        # Accumulate Excel data in memory (written once after all folds)
         sheet = f"Subject_{s_idx+1}"
-        mode  = "a" if excel_cm.exists() else "w"
-        with pd.ExcelWriter(excel_cm, engine="openpyxl", mode=mode,
-                            if_sheet_exists="replace" if mode == "a" else None) as w:
-            pd.DataFrame(conf_mat, index=CLASS_NAMES,
-                         columns=CLASS_NAMES).to_excel(w, sheet_name=sheet)
-        mode = "a" if excel_mt.exists() else "w"
-        with pd.ExcelWriter(excel_mt, engine="openpyxl", mode=mode,
-                            if_sheet_exists="replace" if mode == "a" else None) as w:
-            pd.DataFrame({
-                "Precision": metrics["precision"], "Recall":  metrics["recall"],
-                "F1Score":   metrics["f1"],        "MCC":     metrics["mcc"],
-            }, index=CLASS_NAMES).to_excel(w, sheet_name=sheet)
+        all_cm_data[sheet] = pd.DataFrame(conf_mat, index=CLASS_NAMES, columns=CLASS_NAMES)
+        all_mt_data[sheet] = pd.DataFrame({
+            "Precision": metrics["precision"],
+            "Recall":    metrics["recall"],
+            "F1Score":   metrics["f1"],
+            "MCC":       metrics["mcc"],
+        }, index=CLASS_NAMES)
+
+        # Checkpoint after every completed fold
+        save_checkpoint(ckpt_path, s_idx, fold_metrics, all_cm_data, all_mt_data)
+
+    # ── Write Excel ONCE after all folds ─────────────────────────────────────
+    if all_cm_data:
+        excel_cm = out_dir / "LOSO_ConfusionMatrices.xlsx"
+        excel_mt = out_dir / "LOSO_PerClassMetrics.xlsx"
+        with pd.ExcelWriter(excel_cm, engine="openpyxl") as w:
+            for sheet, df in all_cm_data.items():
+                df.to_excel(w, sheet_name=sheet)
+        with pd.ExcelWriter(excel_mt, engine="openpyxl") as w:
+            for sheet, df in all_mt_data.items():
+                df.to_excel(w, sheet_name=sheet)
+        print(f"  Excel saved → {out_dir}/")
 
     # ── Summary ──────────────────────────────────────────────────────────────
     loso_summary = {}
@@ -497,8 +642,13 @@ def run_loso(subjects, args):
             print(f"  Avg {k:10s}: {avg:.4f}  (std {std:.4f})")
             loso_summary[k] = {"mean": float(avg), "std": float(std)}
         pd.DataFrame(fold_metrics).to_csv(
-            Path(args.out_dir) / "LOSO_Summary.csv", index=False)
+            out_dir / "LOSO_Summary.csv", index=False)
         print(f"  Summary → {args.out_dir}/LOSO_Summary.csv")
+
+        # Delete checkpoint once all folds are complete
+        if ckpt_path.exists():
+            ckpt_path.unlink()
+            print(f"  [Checkpoint] deleted — all folds complete.")
 
     return fold_metrics, loso_summary
 
@@ -511,9 +661,9 @@ def retrain_on_all_data(subjects, args):
     """
     Retrain on every subject and every sample.
     No val split, no early stopping — train for exactly args.epochs.
-    Normalisation is computed from the entire dataset.
     """
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    pin        = device_str == "cuda"
 
     print(f"\n{'='*60}")
     print(f"  PHASE 2 — Full retrain on ALL {len(subjects)} subjects")
@@ -531,19 +681,23 @@ def retrain_on_all_data(subjects, args):
 
     print(f"  Total samples: {len(all_seqs)}")
 
-    # Normalise on the complete dataset
     mu, sigma = compute_normalization(all_seqs)
     norm_seqs = apply_norm_aug(all_seqs, mu, sigma, augment=True)
 
     input_size = norm_seqs[0].shape[1]
-    pin        = device_str == "cuda"
     full_ds    = SequenceDataset(norm_seqs, all_labels)
 
     def make_full_dl(bs):
-        return DataLoader(full_ds, batch_size=bs, shuffle=True,
-                          collate_fn=collate_fn, num_workers=0, pin_memory=pin)
+        return DataLoader(
+            full_ds, batch_size=bs, shuffle=True,
+            collate_fn=collate_fn, num_workers=DL_WORKERS,
+            pin_memory=pin,
+            persistent_workers=(DL_WORKERS > 0),
+            prefetch_factor=2 if DL_WORKERS > 0 else None,
+        )
+
     def make_no_val_dl(bs):
-        return None   # no val set during full retrain
+        return None
 
     model    = LightweightMV2(input_size=input_size, num_classes=NUM_CLASSES)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -553,15 +707,16 @@ def retrain_on_all_data(subjects, args):
 
     def make_optimizer(m):
         return torch.optim.AdamW(m.parameters(), lr=args.lr, weight_decay=1e-4)
+
     def make_scheduler(opt):
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, T_max=args.epochs, eta_min=args.lr * 0.01)
 
-    model, device, used_env, used_batch = _do_train(
+    model, device, used_env, used_batch, _, _ = _do_train(
         model, make_full_dl, make_no_val_dl,
         make_optimizer, make_scheduler,
         criterion, args, device_str, args.batch_size,
-        use_early_stopping=False,   # train all epochs, no early stop
+        use_early_stopping=False,
     )
     print(f"\n  Full retrain done on {used_env.upper()} | batch_size={used_batch}")
     return model.cpu(), input_size, mu, sigma
@@ -573,6 +728,10 @@ def retrain_on_all_data(subjects, args):
 
 def export_model(model, input_size, export_dir, mu, sigma, loso_summary):
     Path(export_dir).mkdir(parents=True, exist_ok=True)
+    # ── Unwrap torch.compile() before export ────────────────────────────────
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+
     model.eval().cpu()
 
     # ── 1. model_state_dict.pt ──────────────────────────────────────────────
@@ -637,7 +796,7 @@ class LightweightMV2(nn.Module):
     Input  : (B, T, C)  — batch x time_steps x features
     Output : (B, num_classes) — raw logits
     """
-    def __init__(self, input_size: int, num_classes: int = 20, dropout: float = 0.2):
+    def __init__(self, input_size: int, num_classes: int = 24, dropout: float = 0.2):
         super().__init__()
         cfg = [(32,1,1,1),(48,2,6,2),(64,1,6,3),(96,2,6,2),(128,1,6,1)]
         layers = [nn.Sequential(
@@ -728,7 +887,7 @@ if __name__ == "__main__":
 # LightweightMV2 — BFRB / Gesture Classification
 
 ## Training Strategy
-**Phase 1 — LOSO cross-validation** across all 11 subjects → unbiased performance estimates.  
+**Phase 1 — LOSO cross-validation** across all 20 subjects → unbiased performance estimates.  
 **Phase 2 — Full retrain on all subjects + all samples** using the same hyperparameters → exported model.
 
 The LOSO metrics below are the reported numbers. The exported weights reflect training on the complete dataset.
@@ -751,7 +910,7 @@ The LOSO metrics below are the reported numbers. The exported weights reflect tr
 | | Shape | Description |
 |-|-------|-------------|
 | Input  | `(B, T, {input_size})` | Batch × time steps × features |
-| Output | `(B, 20)` | Raw logits — apply `softmax` for probabilities |
+| Output | `(B, 24)` | Raw logits — apply `softmax` for probabilities |
 
 ## Preprocessing (must match training exactly)
 1. Raw array shape: `(features={input_size}, time_steps)`
@@ -771,7 +930,7 @@ import torch, numpy as np
 from model_class import LightweightMV2
 
 ckpt  = torch.load("model_state_dict.pt", map_location="cpu")
-model = LightweightMV2(input_size=ckpt["input_size"], num_classes=20)
+model = LightweightMV2(input_size=ckpt["input_size"], num_classes=24)
 model.load_state_dict(ckpt["model_state_dict"])
 model.eval()
 
@@ -811,11 +970,11 @@ def parse_args():
         description="LightweightMV2: LOSO evaluation → full retrain → export",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--data",         default="subjects_cleaned_11subjects.pkl")
+    p.add_argument("--data",         default="subjects_cleaned_20subjects.pkl")
     p.add_argument("--out_dir",      default=OUTPUT_DIR)
     p.add_argument("--export_dir",   default=EXPORT_DIR)
-    p.add_argument("--epochs",       type=int,   default=100)
-    p.add_argument("--batch_size",   type=int,   default=32)
+    p.add_argument("--epochs",       type=int,   default=200)
+    p.add_argument("--batch_size",   type=int,   default=128)
     p.add_argument("--lr",           type=float, default=1e-3)
     p.add_argument("--patience",     type=int,   default=20,
                    help="Early-stopping patience (LOSO folds only)")
@@ -824,11 +983,20 @@ def parse_args():
                    help="Limit LOSO folds for quick testing (0 = all subjects)")
     p.add_argument("--skip_loso",    action="store_true",
                    help="Skip LOSO and go straight to full retrain + export")
+    p.add_argument("--save_cm",      action="store_true",
+                   help="Save per-fold confusion matrix PNGs (slower)")
+    p.add_argument("--compile",      action="store_true",
+                   help="Apply torch.compile() — PyTorch 2+ recommended")
+    p.add_argument("--workers",      type=int,   default=DL_WORKERS,
+                   help="DataLoader worker processes (0=single-process, safest)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    global DL_WORKERS
+    DL_WORKERS = args.workers
 
     if not Path(args.data).exists():
         print(f"[ERROR] Data file not found: {args.data}")
