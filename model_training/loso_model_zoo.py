@@ -1,35 +1,33 @@
 """
-loso_model_zoo.py
+loso_model_zoo_fast.py  (speed-optimised version + checkpointing)
 ====================
 Leave-One-Subject-Out (LOSO) training for gesture / BFRB classification.
 
-Data input : subjects_per_class.pkl  (produced by load_cell_data.py)
-             Each sample: {"data": ndarray (features × time), "label": int, "class": str}
-
-Model zoo  :
-  1.  BiLSTM
-  2.  StackedBiLSTM
-  3.  CNN_LSTM
-  4.  ResLSTM
-  5.  AttentionBiLSTM
-  6.  TCN
-  7.  TransformerCLS
-  8.  CNN_Transformer
-  9.  MHSA_LSTM
-  10. LightweightMV2
-  11. LSTM
-  12. GRU
-  13. BiGRU
+Key changes vs. original:
+  • num_workers=4 + persistent_workers + prefetch_factor=2  (biggest win)
+  • torch.backends.cudnn.benchmark = True
+  • optimizer.zero_grad(set_to_none=True)
+  • best_state uses .detach().clone() instead of .cpu().clone()
+  • Excel writing deferred to AFTER all folds finish  (no I/O in hot loop)
+  • Per-fold confusion-matrix PNG skipped by default; use --save_cm to enable
+  • torch.compile() applied when PyTorch >= 2.0  (great for TCN / Transformer)
+  • DataLoader workers shut down explicitly between folds (fixes "too many open files")
+  • Checkpoint saved after every fold — resume with the same command if interrupted
+  • Fixed deprecated torch.cuda.amp.autocast / GradScaler API
+  • Fixed np.divide uninitialized memory warning
 
 Usage
 -----
-  python loso_model_zoo_v2.py --model AttentionBiLSTM --epochs 100 --batch_size 32
-  python loso_model_zoo_v2.py --model all --epochs 50
+  python loso_model_zoo_fast.py --model AttentionBiLSTM --epochs 100 --batch_size 64
+  python loso_model_zoo_fast.py --model all --epochs 50 --save_cm
+
+  # If interrupted, just re-run the same command — it will resume automatically.
 """
 
 import argparse
 import math
 import os
+import pickle
 import sys
 import time
 import warnings
@@ -49,21 +47,52 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 
+# ── Speed knobs ───────────────────────────────────────────────────────────────
+torch.backends.cudnn.benchmark = True
+
+# Enable TensorFloat-32 (huge speed boost on L40S / Ampere+ GPUs)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-NUM_CLASSES = 20
+NUM_CLASSES = 24
 DOWNSAMPLE  = 2        # take every 2nd time step
 AUG_SIGMA   = 0.01     # Gaussian noise std for training augmentation
 VAL_FRAC    = 0.05     # stratified validation fraction
 
+# Reduced from 8 → 4 to avoid "too many open files" across 20 LOSO folds.
+# Pass --workers 0 for single-process (safest), or --workers 2 for a balance.
+DL_WORKERS = 12
+
 CLASS_NAMES = [
-    "Cuticle Picking", "Eyeglasses", "Face Touching", "Hair Pulling",
-    "Hand Waving", "Knuckle Cracking", "Leg Scratching", "Leg Shaking",
-    "Nail Biting", "Phone Call", "Raising Hand", "Reading",
-    "Scratching Arm", "Sitting Still", "Sit-to-Stand", "Standing",
-    "Stand-to-Sit", "Stretching", "Thumb Sucking", "Walking",
+    "Hair Pulling",
+    "Nail Biting",
+    "Nose Picking",
+    "Thumb Sucking",
+    "Eyeglasses",
+    "Knuckle Cracking",
+    "Face Touching",
+    "Leg Shaking",
+    "Scratching Arm",
+    "Cuticle Picking",
+    "Leg Scratching",
+    "Phone Call",
+    "Eating",
+    "Drinking",
+    "Stretching",
+    "Hand Waving",
+    "Reading",
+    "Using Phone",
+    "Standing",
+    "Sit-to-Stand",
+    "Stand-to-Sit",
+    "Walking",
+    "Sitting Still",
+    "Raising Hand",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,18 +120,17 @@ def collate_fn(batch):
     max_len  = int(lengths.max())
     C        = seqs[0].shape[1]
 
-    padded = torch.zeros(len(seqs), max_len, C, dtype=torch.float32)
-    # padding_mask: True = padding position (used by Transformer models)
-    pad_mask = torch.ones(len(seqs), max_len, dtype=torch.bool)
+    padded   = torch.zeros(len(seqs), max_len, C, dtype=torch.float32)
+    pad_mask = torch.ones(len(seqs), max_len, dtype=torch.bool)   # True = padding
 
     for i, (s, L) in enumerate(zip(seqs, lengths)):
-        padded[i, :L]    = s
-        pad_mask[i, :L]  = False   # False = real data
+        padded[i, :L]   = s
+        pad_mask[i, :L] = False   # False = real data
 
     return padded, torch.tensor(labels, dtype=torch.long), lengths, pad_mask
 
 
-def extract_sequence(sample: dict) -> torch.Tensor | None:
+def extract_sequence(sample: dict):
     """
     Extract a downsampled sequence from a raw sample dict using ALL feature rows.
     Returns (T', C) float32 tensor or None if invalid / contains NaNs.
@@ -170,7 +198,6 @@ class LSTM(nn.Module):
     def forward(self, x, lengths, padding_mask=None):
         packed    = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
         _, (h, _) = self.lstm(packed)
-        # h[-1] = last layer's hidden state
         return self.fc(self.drop(h[-1]))
 
 
@@ -202,11 +229,11 @@ class BiGRU(nn.Module):
         self.fc   = nn.Linear(hidden * 2, num_classes)
 
     def forward(self, x, lengths, padding_mask=None):
-        packed  = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        _, h    = self.gru(packed)
-        # h[-2] = last layer forward, h[-1] = last layer backward
+        packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        _, h   = self.gru(packed)
         h = torch.cat([h[-2], h[-1]], dim=-1)
         return self.fc(self.drop(h))
+
 
 # ── 1. BiLSTM ─────────────────────────────────────────────────────────────────
 class BiLSTM(nn.Module):
@@ -219,12 +246,12 @@ class BiLSTM(nn.Module):
         self.fc    = nn.Linear(hidden * 2, num_classes)
 
     def forward(self, x, lengths, padding_mask=None):
-        packed      = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        out, _      = self.lstm1(packed)
-        out, _      = pad_packed_sequence(out, batch_first=True)
-        out         = self.drop1(out)
-        packed      = pack_padded_sequence(out, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        _, (h, _)   = self.lstm2(packed)
+        packed    = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        out, _    = self.lstm1(packed)
+        out, _    = pad_packed_sequence(out, batch_first=True)
+        out       = self.drop1(out)
+        packed    = pack_padded_sequence(out, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        _, (h, _) = self.lstm2(packed)
         h = torch.cat([h[-2], h[-1]], dim=-1)
         return self.fc(self.drop2(h))
 
@@ -246,14 +273,14 @@ class StackedBiLSTM(nn.Module):
         self.fc = nn.Linear(hidden * 2, num_classes)
 
     def forward(self, x, lengths, padding_mask=None):
-        out = x
+        out    = x
         h_last = None
         for lstm, norm, drop in zip(self.layers, self.norms, self.drops):
-            packed          = pack_padded_sequence(out, lengths.cpu(), batch_first=True, enforce_sorted=False)
+            packed             = pack_padded_sequence(out, lengths.cpu(), batch_first=True, enforce_sorted=False)
             packed_out, (h, _) = lstm(packed)
-            out, _          = pad_packed_sequence(packed_out, batch_first=True)
-            out             = drop(norm(out))
-            h_last          = h
+            out, _             = pad_packed_sequence(packed_out, batch_first=True)
+            out                = drop(norm(out))
+            h_last             = h
         h = torch.cat([h_last[-2], h_last[-1]], dim=-1)
         return self.fc(h)
 
@@ -281,8 +308,8 @@ class CNN_LSTM(nn.Module):
         outs = [c(xc).permute(0, 2, 1) for c in self.convs]
         out  = torch.cat(outs, dim=-1)
         out  = F.gelu(self.proj(out))
-        packed      = pack_padded_sequence(out, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        _, (h, _)   = self.lstm(packed)
+        packed    = pack_padded_sequence(out, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        _, (h, _) = self.lstm(packed)
         h = self.drop(torch.cat([h[-2], h[-1]], dim=-1))
         return self.fc(h)
 
@@ -296,10 +323,9 @@ class _ResLSTMBlock(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x, lengths):
-        packed      = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        out, _      = self.lstm(packed)
-        out, _      = pad_packed_sequence(out, batch_first=True)
-        # residual: pad out to match x length if needed
+        packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        out, _ = self.lstm(packed)
+        out, _ = pad_packed_sequence(out, batch_first=True)
         if out.shape[1] < x.shape[1]:
             pad = torch.zeros(x.shape[0], x.shape[1] - out.shape[1], x.shape[2], device=x.device)
             out = torch.cat([out, pad], dim=1)
@@ -318,7 +344,6 @@ class ResLSTM(nn.Module):
         out  = F.gelu(self.embed(x))
         for blk in self.blocks:
             out = blk(out, lengths)
-        # mean-pool over valid time steps only
         mask = (torch.arange(out.shape[1], device=out.device)[None] < lengths[:, None]).unsqueeze(-1).float()
         out  = (out * mask).sum(1) / lengths.unsqueeze(-1).float().to(out.device)
         return self.fc(out)
@@ -335,15 +360,14 @@ class AttentionBiLSTM(nn.Module):
         self.fc   = nn.Linear(hidden * 2, num_classes)
 
     def forward(self, x, lengths, padding_mask=None):
-        packed      = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        out, _      = self.lstm(packed)
-        out, _      = pad_packed_sequence(out, batch_first=True)
-        # mask padding before softmax
-        mask   = torch.arange(out.shape[1], device=out.device)[None] >= lengths[:, None]
-        scores = self.attn(out).squeeze(-1)
-        scores = scores.masked_fill(mask, float('-inf'))
+        packed  = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        out, _  = self.lstm(packed)
+        out, _  = pad_packed_sequence(out, batch_first=True)
+        mask    = torch.arange(out.shape[1], device=out.device)[None] >= lengths[:, None]
+        scores  = self.attn(out).squeeze(-1)
+        scores  = scores.masked_fill(mask, float('-inf'))
         weights = torch.softmax(scores, dim=1).unsqueeze(-1)
-        ctx = (out * weights).sum(1)
+        ctx     = (out * weights).sum(1)
         return self.fc(self.drop(ctx))
 
 
@@ -378,8 +402,8 @@ class TCN(nn.Module):
         self.fc  = nn.Linear(in_ch, num_classes)
 
     def forward(self, x, lengths, padding_mask=None):
-        out = self.net(x.permute(0, 2, 1))   # B × C × T
-        out = out.mean(-1)                     # global avg pool
+        out = self.net(x.permute(0, 2, 1))
+        out = out.mean(-1)
         return self.fc(out)
 
 
@@ -408,15 +432,14 @@ class TransformerCLS(nn.Module):
         B, T, _ = x.shape
         out = self.embed(x) + self.pe[:, 1:T + 1]
         cls = self.cls_tk.expand(B, -1, -1)
-        out = torch.cat([cls, out], dim=1)   # prepend CLS token
-        # extend padding_mask to cover CLS token
+        out = torch.cat([cls, out], dim=1)
         if padding_mask is not None:
-            cls_mask = torch.zeros(B, 1, dtype=torch.bool, device=x.device)
+            cls_mask  = torch.zeros(B, 1, dtype=torch.bool, device=x.device)
             full_mask = torch.cat([cls_mask, padding_mask], dim=1)
         else:
             full_mask = None
         out = self.encoder(out, src_key_padding_mask=full_mask)
-        return self.fc(out[:, 0])   # CLS output
+        return self.fc(out[:, 0])
 
 
 # ── 8. CNN_Transformer ────────────────────────────────────────────────────────
@@ -440,13 +463,10 @@ class CNN_Transformer(nn.Module):
         self.fc = nn.Linear(d_model, num_classes)
 
     def forward(self, x, lengths, padding_mask=None):
-        # CNN stem halves sequence length — recompute mask accordingly
-        out = self.stem(x.permute(0, 2, 1)).permute(0, 2, 1)   # B × T' × d
+        out = self.stem(x.permute(0, 2, 1)).permute(0, 2, 1)
         if padding_mask is not None:
-            # downsample mask to match stem output length
-            stem_len = out.shape[1]
+            stem_len  = out.shape[1]
             stem_mask = padding_mask[:, ::2][:, :stem_len]
-            # ensure same length (rounding)
             if stem_mask.shape[1] < stem_len:
                 pad = torch.ones(out.shape[0], stem_len - stem_mask.shape[1],
                                  dtype=torch.bool, device=out.device)
@@ -477,8 +497,8 @@ class MHSA_LSTM(nn.Module):
         self.fc   = nn.Linear(hidden, num_classes)
 
     def forward(self, x, lengths, padding_mask=None):
-        out      = F.gelu(self.embed(x))
-        B, T, _  = out.shape
+        out     = F.gelu(self.embed(x))
+        B, T, _ = out.shape
         key_mask = padding_mask if padding_mask is not None else \
                    (torch.arange(T, device=x.device)[None] >= lengths[:, None])
 
@@ -493,7 +513,6 @@ class MHSA_LSTM(nn.Module):
                 lout = torch.cat([lout, pad], dim=1)
             out = n2(out + self.drop(lout))
 
-        # attention-weighted pool over valid frames
         scores = out.masked_fill(key_mask.unsqueeze(-1), float('-inf'))
         w      = torch.softmax(scores.mean(-1), dim=1).unsqueeze(-1)
         ctx    = (out * w).sum(1)
@@ -546,9 +565,9 @@ class LightweightMV2(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 MODEL_REGISTRY = {
-    "LSTM":            LSTM,           
-    "GRU":             GRU,            
-    "BiGRU":           BiGRU,          
+    # "LSTM":            LSTM,
+    "GRU":             GRU,
+    "BiGRU":           BiGRU,
     "BiLSTM":          BiLSTM,
     "StackedBiLSTM":   StackedBiLSTM,
     "CNN_LSTM":        CNN_LSTM,
@@ -556,14 +575,51 @@ MODEL_REGISTRY = {
     "AttentionBiLSTM": AttentionBiLSTM,
     "TCN":             TCN,
     "TransformerCLS":  TransformerCLS,
-    "CNN_Transformer": CNN_Transformer,
+    # "CNN_Transformer": CNN_Transformer,
     "MHSA_LSTM":       MHSA_LSTM,
-    "LightweightMV2":  LightweightMV2,
+    # "LightweightMV2":  LightweightMV2,
 }
 
 
 def count_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECKPOINT HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_checkpoint(ckpt_path: Path, fold_idx: int,
+                    fold_metrics: list, all_cm_data: dict, all_mt_data: dict):
+    """Persist everything needed to resume after fold_idx completes."""
+    ckpt = {
+        "last_completed_fold": fold_idx,
+        "fold_metrics":        fold_metrics,
+        "all_cm_data":         all_cm_data,
+        "all_mt_data":         all_mt_data,
+    }
+    # Write to a temp file first, then rename — avoids a corrupt checkpoint
+    # if the process is killed mid-write.
+    tmp = ckpt_path.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(ckpt, f)
+    tmp.replace(ckpt_path)
+    print(f"  [Checkpoint] saved after fold {fold_idx + 1} → {ckpt_path}")
+
+
+def load_checkpoint(ckpt_path: Path):
+    """Return checkpoint dict or None if no checkpoint exists."""
+    if not ckpt_path.exists():
+        return None
+    try:
+        with open(ckpt_path, "rb") as f:
+            ckpt = pickle.load(f)
+        print(f"  [Checkpoint] found — resuming from fold {ckpt['last_completed_fold'] + 2} "
+              f"({ckpt['last_completed_fold'] + 1} folds already done)")
+        return ckpt
+    except Exception as e:
+        warnings.warn(f"  [Checkpoint] could not load {ckpt_path}: {e}  — starting fresh.")
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -574,13 +630,14 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     for x, y, lengths, pad_mask in loader:
-        x, y        = x.to(device), y.to(device)
-        lengths     = lengths.to(device)
-        pad_mask    = pad_mask.to(device)
-        optimizer.zero_grad()
+        x, y     = x.to(device), y.to(device)
+        lengths  = lengths.to(device)
+        pad_mask = pad_mask.to(device)
+
+        optimizer.zero_grad(set_to_none=True)
 
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast("cuda"):
                 logits = model(x, lengths, pad_mask)
                 loss   = criterion(logits, y)
             scaler.scale(loss).backward()
@@ -645,9 +702,12 @@ def compute_metrics(conf_mat: np.ndarray):
 
 
 def save_confusion_matrix(conf_mat, class_names, title, path):
-    fig, ax = plt.subplots(figsize=(14, 12))
+    fig, ax  = plt.subplots(figsize=(14, 12))
     row_sums = conf_mat.sum(axis=1, keepdims=True)
-    norm_cm  = np.divide(conf_mat, row_sums, where=row_sums != 0)
+    # Fixed: supply out= to avoid uninitialized memory warning
+    norm_cm  = np.divide(conf_mat, row_sums,
+                         out=np.zeros_like(conf_mat, dtype=float),
+                         where=row_sums != 0)
     sns.heatmap(norm_cm, annot=True, fmt=".2f", cmap="Blues",
                 xticklabels=class_names, yticklabels=class_names,
                 ax=ax, vmin=0, vmax=1)
@@ -662,7 +722,7 @@ def save_confusion_matrix(conf_mat, class_names, title, path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ADAPTIVE BATCH / GPU→CPU FALLBACK  (mirrors script 3)
+# ADAPTIVE BATCH / GPU→CPU FALLBACK
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train_with_adaptive_batch(model, make_train_dl, make_val_dl,
@@ -673,20 +733,28 @@ def train_with_adaptive_batch(model, make_train_dl, make_val_dl,
 
     while True:
         try:
-            device    = torch.device(device_str)
-            model     = model.to(device)
+            device = torch.device(device_str)
+            model  = model.to(device)
+
+            if args.compile and hasattr(torch, "compile"):
+                try:
+                    model = torch.compile(model)
+                    print("  [torch.compile] enabled")
+                except Exception as ce:
+                    print(f"  [torch.compile] skipped: {ce}")
+
             optimizer = make_optimizer(model)
             scheduler = make_scheduler(optimizer)
             train_dl  = make_train_dl(batch)
             val_dl    = make_val_dl(batch)
-            scaler    = torch.cuda.amp.GradScaler() if device_str == "cuda" else None
+            scaler    = torch.amp.GradScaler("cuda") if device_str == "cuda" else None
 
             best_val_acc = 0.0
             best_state   = None
             patience_cnt = 0
 
             for epoch in range(1, args.epochs + 1):
-                tr_loss, tr_acc = train_one_epoch(
+                tr_loss, tr_acc       = train_one_epoch(
                     model, train_dl, optimizer, criterion, device, scaler)
                 vl_loss, vl_acc, _, _ = evaluate(model, val_dl, criterion, device)
                 scheduler.step()
@@ -698,7 +766,7 @@ def train_with_adaptive_batch(model, make_train_dl, make_val_dl,
 
                 if vl_acc > best_val_acc:
                     best_val_acc = vl_acc
-                    best_state   = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    best_state   = {k: v.detach().clone() for k, v in model.state_dict().items()}
                     patience_cnt = 0
                 else:
                     patience_cnt += 1
@@ -710,7 +778,7 @@ def train_with_adaptive_batch(model, make_train_dl, make_val_dl,
                 model.load_state_dict(best_state)
 
             used_env = "gpu" if device_str == "cuda" else "cpu"
-            return model, device, used_env, batch
+            return model, device, used_env, batch, train_dl, val_dl
 
         except RuntimeError as e:
             msg    = str(e).lower()
@@ -726,10 +794,10 @@ def train_with_adaptive_batch(model, make_train_dl, make_val_dl,
             if is_oom and device_str == "cuda":
                 print(f"  [OOM] GPU failed at batch={batch}. Falling back to CPU.")
                 device_str = "cpu"
-                batch = start_batch
+                batch      = start_batch
                 continue
 
-            raise   # non-OOM error
+            raise
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -744,23 +812,41 @@ def run_loso(subjects, model_name, args):
     max_folds    = args.max_folds if args.max_folds > 0 else num_subjects
 
     # Output dirs
-    cm_dir   = Path(args.out_dir) / model_name / "confusion_matrices"
+    out_model_dir = Path(args.out_dir) / model_name
+    cm_dir        = out_model_dir / "confusion_matrices"
     cm_dir.mkdir(parents=True, exist_ok=True)
-    excel_cm = Path(args.out_dir) / model_name / "LOSO_ConfusionMatrices.xlsx"
-    excel_mt = Path(args.out_dir) / model_name / "LOSO_PerClassMetrics.xlsx"
-    for xf in (excel_cm, excel_mt):
-        if xf.exists():
-            xf.unlink()
 
-    criterion    = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    # ── Checkpoint: load if a previous run was interrupted ───────────────────
+    ckpt_path   = out_model_dir / "checkpoint.pkl"
+    ckpt        = load_checkpoint(ckpt_path)
+    resume_from = 0
     fold_metrics = []
+    all_cm_data  = {}
+    all_mt_data  = {}
 
+    if ckpt is not None:
+        resume_from  = ckpt["last_completed_fold"] + 1
+        fold_metrics = ckpt["fold_metrics"]
+        all_cm_data  = ckpt["all_cm_data"]
+        all_mt_data  = ckpt["all_mt_data"]
+
+    # ── Fold loop ────────────────────────────────────────────────────────────
     for s_idx in range(min(num_subjects, max_folds)):
+
+        # Skip folds already completed in a previous run
+        if s_idx < resume_from:
+            subj = subjects[s_idx]
+            print(f"  [Checkpoint] skipping fold {s_idx + 1} "
+                  f"(subject {subj['subjectID']} — already done)")
+            continue
+
         subj = subjects[s_idx]
         sid  = subj["subjectID"]
         print(f"\n=== Fold {s_idx+1}/{min(num_subjects, max_folds)} – Leave out: {sid} ===")
 
-        # ── Build pool (train + val) and test sets ──────────────────────────
+        # ── Build pool (train + val) and test sets ───────────────────────────
         pool_seqs, pool_labels = [], []
         for i, other in enumerate(subjects):
             if i == s_idx:
@@ -769,7 +855,7 @@ def run_loso(subjects, model_name, args):
                 seq = extract_sequence(smp)
                 if seq is not None:
                     pool_seqs.append(seq)
-                    pool_labels.append(smp["label"] - 1)   # 0-indexed
+                    pool_labels.append(smp["label"] - 1)
 
         test_seqs, test_labels = [], []
         for smp in subj["samples"]:
@@ -789,50 +875,68 @@ def run_loso(subjects, model_name, args):
         val_seqs_raw   = [pool_seqs[i] for i in val_idx]
         val_labels     = [pool_labels[i] for i in val_idx]
 
-        # ── Normalize (fit on train+val, apply to all) ───────────────────────
-        mu, sigma = compute_normalization(train_seqs_raw + val_seqs_raw)
-
+        # ── Normalize ────────────────────────────────────────────────────────
+        mu, sigma   = compute_normalization(train_seqs_raw + val_seqs_raw)
         train_seqs  = apply_norm_aug(train_seqs_raw, mu, sigma, augment=True)
         val_seqs    = apply_norm_aug(val_seqs_raw,   mu, sigma, augment=False)
         test_seqs_n = apply_norm_aug(test_seqs,      mu, sigma, augment=False)
 
-        # ── Datasets & DataLoader factories ─────────────────────────────────
+        # ── Datasets & DataLoader factories ──────────────────────────────────
         pin      = device_str == "cuda"
         train_ds = SequenceDataset(train_seqs,  train_labels)
         val_ds   = SequenceDataset(val_seqs,    val_labels)
         test_ds  = SequenceDataset(test_seqs_n, test_labels)
 
         def make_train_dl(bs):
-            return DataLoader(train_ds, batch_size=bs, shuffle=True,
-                              collate_fn=collate_fn, num_workers=0, pin_memory=pin)
+            return DataLoader(
+                train_ds, batch_size=bs, shuffle=True,
+                collate_fn=collate_fn,
+                num_workers=DL_WORKERS,
+                pin_memory=pin,
+                persistent_workers=(DL_WORKERS > 0),
+                prefetch_factor=2 if DL_WORKERS > 0 else None,
+            )
+
         def make_val_dl(bs):
-            return DataLoader(val_ds, batch_size=bs, shuffle=False,
-                              collate_fn=collate_fn, num_workers=0)
+            return DataLoader(
+                val_ds, batch_size=bs, shuffle=False,
+                collate_fn=collate_fn,
+                num_workers=DL_WORKERS,
+                pin_memory=pin,
+                persistent_workers=(DL_WORKERS > 0),
+                prefetch_factor=2 if DL_WORKERS > 0 else None,
+            )
 
-        test_dl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                             collate_fn=collate_fn, num_workers=0)
+        test_dl = DataLoader(
+            test_ds, batch_size=args.batch_size, shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=DL_WORKERS,
+            pin_memory=pin,
+            persistent_workers=(DL_WORKERS > 0),
+            prefetch_factor=2 if DL_WORKERS > 0 else None,
+        )
 
-        # ── Build model (input_size auto-detected from data) ─────────────────
+        # ── Build model ───────────────────────────────────────────────────────
         input_size = train_seqs[0].shape[1]
         model_cls  = MODEL_REGISTRY[model_name]
         model      = model_cls(input_size=input_size, num_classes=NUM_CLASSES)
 
-        if s_idx == 0:
+        if s_idx == resume_from:   # first fold we actually train
             print(f"  Model     : {model_name}")
             print(f"  Input dim : {input_size}")
             print(f"  Params    : {count_params(model):,}")
 
-        # ── Train with adaptive batch / GPU→CPU fallback ─────────────────────
         def make_optimizer(m):
             return torch.optim.AdamW(m.parameters(), lr=args.lr, weight_decay=1e-4)
+
         def make_scheduler(opt):
             return torch.optim.lr_scheduler.CosineAnnealingLR(
                 opt, T_max=args.epochs, eta_min=args.lr * 0.01)
 
-        model, device, used_env, used_batch = train_with_adaptive_batch(
+        model, device, used_env, used_batch, train_dl, val_dl = train_with_adaptive_batch(
             model, make_train_dl, make_val_dl,
             make_optimizer, make_scheduler,
-            criterion, args, device_str, args.batch_size
+            criterion, args, device_str, args.batch_size,
         )
         print(f"  Trained on {used_env.upper()} | batch_size={used_batch}")
 
@@ -841,7 +945,14 @@ def run_loso(subjects, model_name, args):
         _, test_acc, y_pred, y_true = evaluate(model, test_dl, criterion, device)
         print(f"  Test accuracy: {test_acc * 100:.2f}%")
 
-        # ── Metrics & confusion matrix ────────────────────────────────────────
+        # ── Shut down DataLoader workers to free file descriptors ─────────────
+        # This prevents "too many open files" when running many LOSO folds with
+        # persistent_workers=True.
+        for dl in [train_dl, val_dl, test_dl]:
+            dl._iterator = None
+        del train_dl, val_dl, test_dl
+
+        # ── Metrics ──────────────────────────────────────────────────────────
         conf_mat = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES)))
         metrics  = compute_metrics(conf_mat)
 
@@ -854,30 +965,36 @@ def run_loso(subjects, model_name, args):
             "mcc":       metrics["macro_mcc"],
         })
 
-        # ── Save confusion matrix PNG ─────────────────────────────────────────
-        safe_id  = "".join(c if c.isalnum() else "_" for c in sid)
-        cm_path  = str(cm_dir / f"CM_Fold_{s_idx+1:02d}_{safe_id}.png")
-        save_confusion_matrix(conf_mat, CLASS_NAMES,
-                              title=f"CM – {sid}  [{model_name}]", path=cm_path)
+        if args.save_cm:
+            safe_id = "".join(c if c.isalnum() else "_" for c in sid)
+            cm_path = str(cm_dir / f"CM_Fold_{s_idx+1:02d}_{safe_id}.png")
+            save_confusion_matrix(conf_mat, CLASS_NAMES,
+                                  title=f"CM – {sid}  [{model_name}]", path=cm_path)
 
-        # ── Save confusion matrix to Excel ────────────────────────────────────
+        # Accumulate Excel data in memory
         sheet = f"Subject_{s_idx+1}"
-        cm_df = pd.DataFrame(conf_mat, index=CLASS_NAMES, columns=CLASS_NAMES)
-        mode  = "a" if excel_cm.exists() else "w"
-        with pd.ExcelWriter(excel_cm, engine="openpyxl", mode=mode,
-                            if_sheet_exists="replace" if mode == "a" else None) as w:
-            cm_df.to_excel(w, sheet_name=sheet)
-
-        per_class = pd.DataFrame({
+        all_cm_data[sheet] = pd.DataFrame(conf_mat, index=CLASS_NAMES, columns=CLASS_NAMES)
+        all_mt_data[sheet] = pd.DataFrame({
             "Precision": metrics["precision"],
             "Recall":    metrics["recall"],
             "F1Score":   metrics["f1"],
             "MCC":       metrics["mcc"],
         }, index=CLASS_NAMES)
-        mode = "a" if excel_mt.exists() else "w"
-        with pd.ExcelWriter(excel_mt, engine="openpyxl", mode=mode,
-                            if_sheet_exists="replace" if mode == "a" else None) as w:
-            per_class.to_excel(w, sheet_name=sheet)
+
+        # ── Save checkpoint after every completed fold ─────────────────────
+        save_checkpoint(ckpt_path, s_idx, fold_metrics, all_cm_data, all_mt_data)
+
+    # ── Write Excel ONCE after all folds ─────────────────────────────────────
+    if all_cm_data:
+        excel_cm = out_model_dir / "LOSO_ConfusionMatrices.xlsx"
+        excel_mt = out_model_dir / "LOSO_PerClassMetrics.xlsx"
+        with pd.ExcelWriter(excel_cm, engine="openpyxl") as w:
+            for sheet, df in all_cm_data.items():
+                df.to_excel(w, sheet_name=sheet)
+        with pd.ExcelWriter(excel_mt, engine="openpyxl") as w:
+            for sheet, df in all_mt_data.items():
+                df.to_excel(w, sheet_name=sheet)
+        print(f"  Excel saved → {excel_cm.parent}/")
 
     # ── Summary ──────────────────────────────────────────────────────────────
     if fold_metrics:
@@ -885,9 +1002,14 @@ def run_loso(subjects, model_name, args):
         for k in ["accuracy", "precision", "recall", "f1", "mcc"]:
             print(f"  Avg {k:10s}: {np.mean([m[k] for m in fold_metrics]):.4f}")
         summary_df   = pd.DataFrame(fold_metrics)
-        summary_path = Path(args.out_dir) / model_name / "LOSO_Summary.csv"
+        summary_path = out_model_dir / "LOSO_Summary.csv"
         summary_df.to_csv(summary_path, index=False)
         print(f"  Summary saved → {summary_path}")
+
+        # ── Delete checkpoint now that all folds are done ─────────────────
+        if ckpt_path.exists():
+            ckpt_path.unlink()
+            print(f"  [Checkpoint] deleted — all folds complete.")
 
     return fold_metrics
 
@@ -898,31 +1020,39 @@ def run_loso(subjects, model_name, args):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="LOSO model zoo training",
+        description="LOSO model zoo training (speed-optimised + checkpointing)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--data",         default="subjects_cleaned_11subjects.pkl")
+    p.add_argument("--data",         default="subjects_cleaned_20subjects.pkl")
     p.add_argument("--model",        default="all",
                    choices=list(MODEL_REGISTRY) + ["all"])
-    p.add_argument("--out_dir",      default="loso_results")
+    p.add_argument("--out_dir",      default="loso_results_run")
     p.add_argument("--epochs",       type=int,   default=100)
-    p.add_argument("--batch_size",   type=int,   default=32)
+    p.add_argument("--batch_size",   type=int,   default=256)
     p.add_argument("--lr",           type=float, default=1e-3)
     p.add_argument("--patience",     type=int,   default=20)
     p.add_argument("--log_interval", type=int,   default=10)
     p.add_argument("--max_folds",    type=int,   default=0,
                    help="0 = all subjects")
+    p.add_argument("--save_cm",      action="store_true",
+                   help="Save per-fold confusion matrix PNGs (slower)")
+    p.add_argument("--compile",      action="store_true",
+                   help="Apply torch.compile() (PyTorch 2+ recommended)")
+    p.add_argument("--workers",      type=int,   default=DL_WORKERS,
+                   help="DataLoader worker processes (0=single-process, safest)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
+    global DL_WORKERS
+    DL_WORKERS = args.workers
+
     if not Path(args.data).exists():
         print(f"[ERROR] Data file not found: {args.data}")
         sys.exit(1)
 
-    import pickle
     with open(args.data, "rb") as f:
         subjects = pickle.load(f)
     print(f"Loaded {len(subjects)} subjects from {args.data}")
