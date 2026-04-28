@@ -68,16 +68,35 @@ TARGET_FPS = 10
 BUFFER_FRAMES = WINDOW_SECONDS * TARGET_FPS
 
 CLASS_NAMES = [
-    "Cuticle Picking", "Eyeglasses",       "Face Touching",  "Hair Pulling",
-    "Hand Waving",     "Knuckle Cracking",  "Leg Scratching", "Leg Shaking",
-    "Nail Biting",     "Phone Call",        "Raising Hand",   "Reading",
-    "Scratching Arm",  "Sitting Still",     "Sit-to-Stand",   "Standing",
-    "Stand-to-Sit",    "Stretching",        "Thumb Sucking",  "Walking",
+    "Hair Pulling",
+    "Nail Biting",
+    "Nose Picking",
+    "Thumb Sucking",
+    "Eyeglasses",
+    "Knuckle Cracking",
+    "Face Touching",
+    "Leg Shaking",
+    "Scratching Arm",
+    "Cuticle Picking",
+    "Leg Scratching",
+    "Phone Call",
+    "Eating",
+    "Drinking",
+    "Stretching",
+    "Hand Waving",
+    "Reading",
+    "Using Phone",
+    "Standing",
+    "Sit-to-Stand",
+    "Stand-to-Sit",
+    "Walking",
+    "Sitting Still",
+    "Raising Hand",
 ]
 BFRB_CLASSES = {
     "Cuticle Picking", "Eyeglasses", "Face Touching", "Hair Pulling",
     "Knuckle Cracking", "Leg Scratching", "Leg Shaking",
-    "Nail Biting", "Scratching Arm", "Thumb Sucking",
+    "Nail Biting", "Scratching Arm", "Thumb Sucking","Nose Picking"
 }
 
 METRICS_DIR = Path(__file__).resolve().parent / "metrics"
@@ -874,7 +893,7 @@ class InferenceThread(QThread):
                 payload = {"features": data.tolist()}
                 t0 = time.time()
                 resp = requests.post(
-                    "http://16.170.202.62:8000/predict",
+                    "", # place the public ip here
                     json=payload, timeout=10)
                 latency_ms = (time.time() - t0) * 1000
                 rj = resp.json()
