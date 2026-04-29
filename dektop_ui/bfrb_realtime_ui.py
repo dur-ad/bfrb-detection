@@ -888,7 +888,7 @@ class InferenceThread(QThread):
             try:
                 df = pd.DataFrame(buf, columns=ALL_COLS)
                 df = df.ffill().bfill().fillna(0.0)
-                data = df.values.astype(np.float32)[::2, :]
+                data = df.values.astype(np.float32)
                 if data.shape[0] < 5: continue
                 payload = {"features": data.tolist()}
                 t0 = time.time()
