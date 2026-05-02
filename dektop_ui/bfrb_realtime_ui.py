@@ -1501,12 +1501,11 @@ class DashboardWidget(QWidget):
             lv.addWidget(self.video_label, stretch=1)
 
             stat_row = QHBoxLayout()
-            self.fps_lbl     = QLabel("FPS: —")
+            self.fps_lbl     = QLabel("")
             self.latency_lbl = QLabel("")
             self.track_lbl   = QLabel("● Idle")
             for lbl in [self.fps_lbl, self.latency_lbl, self.track_lbl]:
                 lbl.setStyleSheet(f"color:{THEME['subtext']}; font-size:13px;")
-            stat_row.addWidget(self.fps_lbl)
             stat_row.addStretch()
             stat_row.addWidget(self.track_lbl)
             lv.addLayout(stat_row)
