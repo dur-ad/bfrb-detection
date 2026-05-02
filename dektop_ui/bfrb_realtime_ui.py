@@ -893,7 +893,7 @@ class InferenceThread(QThread):
                 payload = {"features": data.tolist()}
                 t0 = time.time()
                 resp = requests.post(
-                    "", # place the public ip here
+                    "http://56.228.21.72:8000/predict",
                     json=payload, timeout=10)
                 latency_ms = (time.time() - t0) * 1000
                 rj = resp.json()
@@ -1304,7 +1304,8 @@ class PerformanceTab(QWidget):
                     sessions.append(json.load(f))
             except Exception:
                 pass
-        sessions.sort(key=lambda s: s.get("meta", {}).get("session_id", 0))
+        # Show latest sessions first in admin performance views.
+        sessions.sort(key=lambda s: s.get("meta", {}).get("session_id", 0), reverse=True)
         return sessions
 
     def refresh(self):
@@ -1781,6 +1782,7 @@ class DashboardWidget(QWidget):
         self.session_started.emit(self.session_id)
 
         self.cam_thread = CameraThread(
+            cam_idx=1,
             show_skeleton=bool(prefs.get("skeleton_overlay", 1)))
         self.cam_thread.frame_ready.connect(self._on_frame)
         self.cam_thread.error.connect(lambda e: self.session_status.setText(f"Error: {e}"))
@@ -1944,9 +1946,9 @@ class DashboardWidget(QWidget):
         if not sessions: return
         latest = sessions[0]
         sid = latest["session_id"]
-        event_count = latest.get("event_count", 0) or 0
-        self.bfrb_lbl.setText(str(event_count))
         events = db.get_events_for_session(sid)
+        # Use event logs so count updates live while a session is running.
+        self.bfrb_lbl.setText(str(len(events)))
         if events:
             latest_event = events[-1]
             latest_event_id = latest_event.get("event_id")
@@ -2420,7 +2422,9 @@ class AppWindow(QMainWindow):
         self.is_admin = user["account_type"] == "admin"
         self.setWindowTitle(
             f"BFRB Detector  —  {'Admin' if self.is_admin else user['username']}")
-        self.setMinimumSize(1280, 800)
+        # Keep the app resizable instead of forcing near-fullscreen dimensions.
+        self.setMinimumSize(900, 600)
+        self.resize(1280, 800)
         self.setStyleSheet(APP_STYLE)
         self.setWindowIcon(QIcon(make_app_icon()))
         self._build()
