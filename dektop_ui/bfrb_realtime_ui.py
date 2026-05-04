@@ -1,10 +1,8 @@
 """
-BFRB Real-Time Recognition UI  —  Full Application  (with Metrics Reporting)
-=============================================================================
+BFRB Real-Time Recognition UI  —  Full Application  
+==================================================
 Files needed in same directory:
   - database.py        (included in project)
-  - model_class.py     (for local fallback)
-  - model_state_dict.pt (optional, for local fallback)
 
 Run:
     python bfrb_realtime_ui.py
@@ -337,31 +335,31 @@ class SessionMetrics:
         self.end_ts         = None
 
         # Latency (ms)
-        self.latencies: list[float] = []
+        self.latencies: list[float] = [] #every valid inference latency in ms
 
         # Frame tracking counters
-        self.frames_total        = 0
-        self.frames_full_body    = 0   # pose + both hands
-        self.frames_pose_only    = 0   # pose but missing >= 1 hand
+        self.frames_total        = 0 #total frames passed to record_frame()
+        self.frames_full_body    = 0 #pose + both hands
+        self.frames_pose_only    = 0 #pose but missing >= 1 hand
         self.frames_no_pose      = 0
 
         # Buffer
-        self.buffer_fill_times: list[float] = []  # seconds to fill each window
+        self.buffer_fill_times: list[float] = []  #how many seconds to collect 50 good frames
         self._buffer_start_ts   = None
 
         # Inference results
-        self.inference_count     = 0
+        self.inference_count     = 0 #number of successful inference calls
         self.bfrb_detections     = 0
-        self.top1_confidences: list[float] = []
-        self.class_counts: dict  = {}   # {class_name: count as top-1}
+        self.top1_confidences: list[float] = [] #top-1 probability for each inference
+        self.class_counts: dict  = {} #{class_name: count_of_times_it_was_top1}
 
         # Errors
-        self.timeout_count       = 0
+        self.timeout_count       = 0 
         self.http_error_count    = 0
 
         # Process memory (RSS)
         self.ram_samples_mb: list[float] = []
-        self._ram_sample_interval_s = 1.0
+        self._ram_sample_interval_s = 1.0 #sample at most once per second
         self._last_ram_sample_ts = 0.0
         self._proc = None
         if psutil is not None:
@@ -385,6 +383,7 @@ class SessionMetrics:
             pass
 
     # ── Called by CameraThread ────────────────────────────────────────────
+    #buffer‑fill timer only runs when we have consecutive full‑body frames
     def record_frame(self, has_body: bool, has_lhand: bool, has_rhand: bool):
         self._sample_ram()
         self.frames_total += 1
@@ -864,42 +863,42 @@ class InferenceThread(QThread):
         super().__init__()
         self.sensitivity        = sensitivity
         self.metrics            = metrics
-        self._buffer            = collections.deque(maxlen=BUFFER_FRAMES)
-        self._lock              = threading.Lock()
+        self._buffer            = collections.deque(maxlen=BUFFER_FRAMES) #A deque with a maximum size: when you add a 51st item, the oldest one is automatically discarded.
+        self._lock              = threading.Lock() #mutex to protect the buffer.
         self._running           = False
         self._trigger           = threading.Event()
 
     def push_frame(self, row_dict):
-        with self._lock:
+        with self._lock: #acquires the lock (prevents the inference loop from reading at the same time).
             self._buffer.append(row_dict)
             if len(self._buffer) >= BUFFER_FRAMES:
                 if self.metrics:
                     self.metrics.record_buffer_filled()
-                self._trigger.set()
+                self._trigger.set() #wakes up the inference loop to process the buffer.
 
     def run(self):
         self._running = True
         while self._running:
-            self._trigger.wait()
+            self._trigger.wait() #until trigger is set
             self._trigger.clear()
             with self._lock:
-                buf = list(self._buffer)
-            if len(buf) < 10: continue
+                buf = list(self._buffer)[-BUFFER_FRAMES:]
+            if len(buf) < BUFFER_FRAMES: continue
             try:
                 df = pd.DataFrame(buf, columns=ALL_COLS)
                 df = df.ffill().bfill().fillna(0.0)
                 data = df.values.astype(np.float32)
                 if data.shape[0] < 5: continue
-                payload = {"features": data.tolist()}
+                payload = {"features": data.tolist()} #builds the json payload
                 t0 = time.time()
                 resp = requests.post(
-                    "http://56.228.21.72:8000/predict",
+                    "", #add predict endpoint here
                     json=payload, timeout=10)
                 latency_ms = (time.time() - t0) * 1000
                 rj = resp.json()
                 if "predictions" not in rj: continue
                 top5 = [(item["class"], float(item["probability"]))
-                        for item in rj["predictions"]]
+                        for item in rj["predictions"]] #("Hair Pulling", 0.87)
                 top_name = top5[0][0] if top5 else ""
                 top_conf = top5[0][1] if top5 else 0.0
                 is_bfrb  = top_name in BFRB_CLASSES and top_conf >= self.sensitivity
@@ -909,7 +908,7 @@ class InferenceThread(QThread):
 
                 self.prediction_ready.emit(top5, latency_ms, is_bfrb)
                 with self._lock:
-                    self._buffer.clear()
+                    self._buffer.clear() # clears the deque buffer after processing
 
             except requests.exceptions.Timeout:
                 if self.metrics: self.metrics.record_inference(0, [], False, timed_out=True)
@@ -1196,7 +1195,7 @@ class LineChart(QWidget):
         p.restore()
 
 # =============================================================================
-# PERFORMANCE TAB  (for report)
+# PERFORMANCE TAB  
 # =============================================================================
 class PerformanceTab(QWidget):
     """
@@ -1930,13 +1929,34 @@ class DashboardWidget(QWidget):
             else:
                 bar.set_data("", 0.0, False)
 
+    def _format_time_ago(self, delta):
+        seconds = int(delta.total_seconds())
+        if seconds < 0:
+            return "just now"
+        if seconds < 60:
+            return "just now"
+        minutes = seconds // 60
+        if minutes < 60:
+            return "1 min ago" if minutes == 1 else f"{minutes} mins ago"
+        hours = minutes // 60
+        if hours < 24:
+            return "1 hour ago" if hours == 1 else f"{hours} hours ago"
+        days = hours // 24
+        if days < 7:
+            return "1 day ago" if days == 1 else f"{days} days ago"
+        weeks = days // 7
+        if weeks < 4:
+            return "1 week ago" if weeks == 1 else f"{weeks} weeks ago"
+        months = days // 30
+        if months < 12:
+            return "1 month ago" if months == 1 else f"{months} months ago"
+        years = days // 365
+        return "1 year ago" if years == 1 else f"{years} years ago"
+
     def _update_time_ago(self):
         if not self.last_detection: return
         delta = datetime.now() - self.last_detection
-        mins  = int(delta.total_seconds() // 60)
-        if mins == 0:   self.time_ago_lbl.setText("just now")
-        elif mins == 1: self.time_ago_lbl.setText("1 min ago")
-        else:           self.time_ago_lbl.setText(f"{mins} mins ago")
+        self.time_ago_lbl.setText(self._format_time_ago(delta))
 
     def _poll_user_stats(self):
         if self.is_admin: return
@@ -1964,11 +1984,7 @@ class DashboardWidget(QWidget):
             try:
                 ts = datetime.fromisoformat(latest_event["timestamp"])
                 self.last_detection = ts
-                delta = datetime.now() - ts
-                mins = int(delta.total_seconds() // 60)
-                if mins == 0:   self.time_ago_lbl.setText("just now")
-                elif mins == 1: self.time_ago_lbl.setText("1 min ago")
-                else:           self.time_ago_lbl.setText(f"{mins} mins ago")
+                self.time_ago_lbl.setText(self._format_time_ago(datetime.now() - ts))
             except Exception:
                 pass
             if is_new_event:
@@ -2114,7 +2130,7 @@ class DashboardWidget(QWidget):
         if self.session_metrics: self.session_metrics.save()
 
 # =============================================================================
-# SETTINGS TAB (unchanged)
+# SETTINGS TAB 
 # =============================================================================
 class SettingsTab(QWidget):
     prefs_saved = pyqtSignal(dict)
